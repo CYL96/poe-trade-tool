@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         POE2 装备防御与武器伤害排序浮窗
 // @namespace    poe-trade-tool
-// @version      2.7.2
-// @description  自动列出已加载装备，支持护甲防御、武器处理后总伤（可选按攻速、显示性价比与五类伤害明细）、孔内增幅点伤估算与行内伤害占比条。
+// @version      2.9.2
+// @description  自动列出已加载装备，支持护甲防御（孔内增幅默认不计入，勾选「防御百分比」/「魔力」后才估算，另有魔力换盾、特殊孔、性价比与防御占比条）与武器处理后总伤（可选按攻速、显示性价比与五类伤害明细）、孔内增幅点伤估算与行内伤害占比条。
 // @match        https://www.pathofexile.com/trade2*
 // @match        https://poe.game.qq.com/trade2*
 // @run-at       document-idle
@@ -32,7 +32,24 @@
   // https://www.pathofexile.com/api/trade2/data/stats：Runic Ward 百分比 ID。
   // 按用户指定模型估算，不将品质或局部/全局归类视为已验证游戏机制。
   const WARD_RUNE = 'stat_830161081';
-  const MAXIMUM_DEFENSE_PER_SOCKET = [0.18, 0.20];
+  // 防御符文每孔增幅（高阶 / 完美）沿用既有用户指定模型，档位顺序与武器 AUGMENT_TIERS 对齐。
+  // 仅在勾选「防御百分比」或「魔力」（魔力换盾）时并入估算；假定补孔只用于显示，不进入防御计算与排序。
+  const DEFENSE_AUGMENT_PER_SOCKET = [0.18, 0.20];
+  // 魔力增幅每孔数值（高阶 / 完美）核对 https://poe2db.tw/us/Greater_Mind_Rune 与 /Perfect_Mind_Rune
+  // （2026-10-09）：Armour 行每孔 +40 / +50 最大魔力；不采用 Wand or Staff 行，也不采用 Bonded 效果。
+  const MANA_AUGMENT_PER_SOCKET = [40, 50];
+  // 「魔力换盾」按用户指定模型估算，不将 1 魔力 = 1 护盾或属性折算视为已验证游戏机制：
+  // 装备自身魔力 = 非孔内最大魔力词缀 + 2 × (非孔内智慧 + 全能力)，1 全能力按其中 1 智慧计（同样折 2 魔力，不乘三）。
+  // 用户确认口径：孔内增幅默认不计入，只有勾选「防御百分比」/「魔力」才按所选档位加入估算；
+  // 因此孔内符文提供的最大魔力、智慧与全能力都不进默认结果，勾选后也不与所选增幅叠加。
+  // 命定 Bonded 使用独立 ID（stat_2926029365）且不计入；pseudo 汇总不在 stat 词缀列表内；角色与天赋魔力不计。
+  const MANA_PER_INTELLIGENCE = 2;
+  const MANA_SHIELD_PER_MANA = 1;
+  // 最大魔力与属性 ID 核对官方 https://www.pathofexile.com/api/trade2/data/stats（2026-10-09）：
+  // 「# to maximum Mana」「# to Intelligence」与两条「# to all Attributes」（普通与特殊来源）。
+  const EQUIPMENT_MANA_IDS = new Set(['stat_1050105434']);
+  const INTELLIGENCE_IDS = new Set(['stat_328541901']);
+  const ALL_ATTRIBUTES_IDS = new Set(['stat_1379411836', 'stat_2897413282']);
   // 增幅数值按 https://poe2db.tw/us/Rune（2026-10-09 核对）Martial Weapon 行：
   // 铁符文高阶 18%/完美 20% 物理；沙漠 13–16/17–20 火；冰河 9–15/16–20 冰；风暴 1–30/1–40 电。
   // Wand/Staff 行是法术相关词缀，不适用于攻击武器面板；高阶在前，完美在后。
@@ -72,6 +89,13 @@
     { key: 'cold', label: '冰冷', color: '#70C8F2' },
     { key: 'chaos', label: '混沌', color: '#AE78DB' },
   ];
+  // 防御占比条：固定顺序护甲 → 闪避 → 护盾 → 保护；颜色沿用详细行配色，保护为紫色。
+  const DEFENSE_BREAKDOWN = [
+    { key: 'ar', label: '护甲', color: '#ff9292' },
+    { key: 'ev', label: '闪避', color: '#91db91' },
+    { key: 'es', label: '护盾', color: '#85baff' },
+    { key: 'ward', label: '保护', color: '#c9a0ff' },
+  ];
   // 元素伤害面板按页面自身标记区分类型：旧 colour 类或新 CSS 变量；仅按标记唯一判定，不按出现顺序猜类型。
   const ELEMENTAL_TYPES = [
     { key: 'fire', selector: '.colourFireDamage, [style*="--colour-fire-damage"]' },
@@ -89,7 +113,9 @@
   const VERIFIED_EFFECT_RUNE_IDS = new Set(['stat_3336890334']);
   const fmt = value => Number.isFinite(value) ? value.toLocaleString('zh-CN', { maximumFractionDigits: 2 }) : '—';
   const fmtRatio = value => Number.isFinite(value) ? value.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : '—';
-  const fmtDefense = value => Number.isFinite(value) ? fmt(Math.floor(value)) : '—';
+  // 防御数值向下取整显示；容忍二进制浮点表示误差（如 679.9999999999999 视为 680），
+  // 防御面板数量级下 1e-6 远低于有效精度，不掩盖真实小数。
+  const fmtDefense = value => Number.isFinite(value) ? fmt(Math.floor(value + 1e-6)) : '—';
   const text = element => (element?.textContent || '').replace(/\u00a0/g, ' ').trim();
   const number = value => {
     const match = value.replace(/,/g, '').match(/[+-]?\d+(?:\.\d+)?/);
@@ -401,10 +427,10 @@
       if (mod.id === JEWEL_SOCKET_RUNE) jewelSocket = true;
     }
     const boundSocketCount = boundMarkers.size + boundConversions;
-    if (jewelSocket) return { total: socketCount, count: 0, title: `总孔 ${socketCount}，可用孔 0；卡迪根的顿悟已将增幅孔转为珠宝孔（不追加18%/20%防御，不假定补孔）` };
+    if (jewelSocket) return { total: socketCount, count: 0, supplemented: false, title: `总孔 ${socketCount}，可用孔 0；卡迪根的顿悟已将增幅孔转为珠宝孔（不追加18%/20%防御，不假定补孔）` };
     if (socketCount > 0 || boundSocketCount > 0) {
       const count = Math.max(0, socketCount - boundSocketCount);
-      return { total: socketCount, count, title: `总孔 ${socketCount}，可用孔 ${count}（可替换增幅，普通已填符文仍可用）${boundSocketCount ? `；绑定增幅孔 ${boundSocketCount}，绑定孔不可用` : ''}` };
+      return { total: socketCount, count, supplemented: false, title: `总孔 ${socketCount}，可用孔 ${count}（可替换增幅，普通已填符文仍可用）${boundSocketCount ? `；绑定增幅孔 ${boundSocketCount}，绑定孔不可用` : ''}` };
     }
     // Reuse the reference helper's type-property convention, never names/mods
     // or the numeric Armour panel as evidence that an item is body armour.
@@ -420,12 +446,12 @@
       { pattern: /\bGloves\b|手套/i, label: '手套', count: 1 },
       { pattern: /\bBoots\b|靴子|靴|鞋子/i, label: '鞋子', count: 1 },
     ]).find(slot => slot.pattern.test(type));
-    if (!slot) return { total: socketCount, count: socketCount, title: `总孔 ${socketCount}，可用孔 ${socketCount}` };
+    if (!slot) return { total: socketCount, count: socketCount, supplemented: false, title: `总孔 ${socketCount}，可用孔 ${socketCount}` };
     // 腐化/圣化复用共享状态判定，不假定补孔；复制是否禁止补孔未验证，不改变孔规则。
     const blocked = states.some(state => state.key === 'corrupted' || state.key === 'sanctified');
     const supplemented = socketCount === 0 && slot && !blocked;
     const count = supplemented ? slot.count : socketCount;
-    return { total: count, count, title: supplemented ? `总孔 ${count}，可用孔 ${count}；原孔 0，按${slot.label}补 ${slot.count}（假定补孔${weapon ? '，不影响点伤或总伤' : ''}）` : `总孔 ${socketCount}，可用孔 ${socketCount}${blocked ? '；腐化或圣化，不假定补孔' : ''}` };
+    return { total: count, count, supplemented, title: supplemented ? `总孔 ${count}，可用孔 ${count}；原孔 0，按${slot.label}补 ${slot.count}（假定补孔${weapon ? '，不影响点伤或总伤' : '，不参与计算'}）` : `总孔 ${socketCount}，可用孔 ${socketCount}${blocked ? '；腐化或圣化，不假定补孔' : ''}` };
   }
   function readModifiers(row) {
     const mods = [];
@@ -443,6 +469,46 @@
     }
     return mods;
   }
+  // 固定词缀数值（如「+100 to maximum Mana」）。已收录的魔力与属性 ID 都是平坦值，
+  // 出现百分比说明不是预期词缀，按无法解析处理，不猜数值。
+  function flatValue(mod) {
+    if (mod.percent !== null) return null;
+    const match = mod.text.replace(/,/g, '').match(/[+-]?\d+(?:\.\d+)?/);
+    return match ? Number(match[0]) : null;
+  }
+  // 装备自身魔力 = 最大魔力词缀合计 + 2 × (智慧 + 全能力)，跳过 rune 类型词缀：孔内增幅默认不计入，
+  // 只有勾选增幅时才按所选档位加入，避免与所选估算重复累计。跳过的符文也不参与解析失败判定。
+  function readEquipmentMana(mods) {
+    const totals = { affix: 0, intelligence: 0, attributes: 0 };
+    let invalid = '';
+    for (const mod of mods) {
+      if (mod.type === 'rune') continue;
+      const group = EQUIPMENT_MANA_IDS.has(mod.id) ? 'mana' : INTELLIGENCE_IDS.has(mod.id) ? 'intelligence' : ALL_ATTRIBUTES_IDS.has(mod.id) ? 'attributes' : null;
+      if (!group) continue;
+      const value = flatValue(mod);
+      if (value === null) { if (!invalid) invalid = mod.text; continue; }
+      if (group === 'mana') totals.affix += value;
+      else totals[group] += value;
+    }
+    return { totals, affix: totals.affix, equipment: totals.affix + MANA_PER_INTELLIGENCE * (totals.intelligence + totals.attributes), invalid };
+  }
+  function augmentPerSocketText(augment) {
+    const value = augment.unit === 'flat' ? `${fmt(augment.perSocket)} 魔力` : `${fmt(augment.perSocket * 100)}%`;
+    if (augment.multiplier === 1) return value;
+    const base = augment.unit === 'flat' ? fmt(augment.base) : `${fmt(augment.base * 100)}%`;
+    return `${value}（档位 ${base} × ${fmt(augment.multiplier)} 向下取整）`;
+  }
+  // 「总防御」悬停：最终分量、公式与增幅口径；失败时给出原因，并说明增幅的孔数扣除口径。
+  function armourTotalTitle(item) {
+    if (item.reason) return item.reason;
+    const augment = item.augment;
+    const augmentText = `增幅：${augment.label} · ${augment.tierName}，每孔 ${augmentPerSocketText(augment)}；可用孔 ${augment.available} − 特殊孔 ${augment.specialSockets} = ${augment.sockets} 孔${item.socketDisplay.supplemented ? '（假定补孔不参与计算）' : ''}`;
+    const manaText = item.mana
+      ? `魔力换盾：装备自身魔力 = 词缀 ${fmt(item.mana.affix)} + 智慧 ${fmt(item.mana.totals.intelligence)} × ${MANA_PER_INTELLIGENCE} + 全能力 ${fmt(item.mana.totals.attributes)} × ${MANA_PER_INTELLIGENCE} = ${fmt(item.mana.equipment)}${item.mana.augmentSockets > 0 ? `；增幅魔力 = ${item.mana.augmentSockets} 孔 × ${fmt(item.mana.perSocket)} = ${fmt(item.mana.augmentMana)}` : ''}；转换护盾 = ${fmt(item.mana.converted)}（1 魔力 = 1 护盾，按指定模型估算，不计品质与防御增幅${item.mana.augmentSockets > 0 ? '' : '；孔内魔力符文不计入'}）`
+      : '';
+    if (item.totalReason) return `${item.totalReason}\n${augmentText}${manaText ? `\n${manaText}` : ''}`;
+    return `${breakdown(item.totalComponents)}\n品质 ${fmt(item.quality)}% → ${fmt(Math.max(item.quality, 20))}%\n${item.socketDisplay.title}\n${item.formulas.join('\n')}${manaText ? `\n${manaText}` : ''}\n合计 ${fmt(item.total)}，向下取整显示 ${fmtDefense(item.total)}；排序使用未取整值。\n裸基础是中间反推量；${augment.enabled ? `「总防御」已并入所选增幅估算（${augmentText}）` : '「总防御」不含孔内增幅（未选增幅估算）'}${item.mana ? '，护盾另含魔力换盾估算' : ''}；不计角色加成与其他词缀。`;
+  }
   function readEquipment(row, index) {
     const mods = readModifiers(row);
     const sockets = row.querySelector('.sockets');
@@ -457,10 +523,27 @@
       price: readPrice(row),
       quality: qualityText ? number(qualityText) : 0,
       current: values.some(value => value !== null) ? values.reduce((sum, value) => sum + (value ?? 0), 0) : null,
-      normalized: null, components: [], formulas: [], reason: '',
-      maximums: MAXIMUM_DEFENSE_PER_SOCKET.map(perSocket => ({ perSocket, value: null, total: 0, components: [], formulas: [], reason: '' })),
+      formulas: [], reason: '',
+      total: null, totalComponents: [], totalReason: '', augment: null, mana: null, totalTitle: '',
+      defensePerPrice: null, defensePerPriceTitle: '', defenseBreakdown: null,
     };
     calculate(item);
+    // 性价比：除以标价金额（沿用「仅按金额，不换算货币」口径）；总防御或金额不可得时不计算。
+    const priceAmount = number(item.price);
+    item.defensePerPrice = Number.isFinite(item.total) && Number.isFinite(priceAmount) && priceAmount > 0 ? item.total / priceAmount : null;
+    item.defensePerPriceTitle = Number.isFinite(item.defensePerPrice)
+      ? `性价比 = 总防御 ${fmt(item.total)} ÷ 价格金额 ${fmt(priceAmount)} = ${fmtRatio(item.defensePerPrice)}（保留2位小数，排序使用未取整值）\n仅按标价金额，不换算货币；总防御${item.augment.enabled ? `含所选增幅估算（${item.augment.label} · ${item.augment.tierName}）` : '为去除孔内增幅的基础值，未选增幅估算'}${item.mana ? '，护盾含魔力换盾估算' : ''}。`
+      : !Number.isFinite(priceAmount) || priceAmount <= 0
+        ? '未读取到有效的价格金额，无法计算性价比。'
+        : `总防御不可得（${item.totalReason || item.reason}），无法计算性价比。`;
+    item.totalTitle = armourTotalTitle(item);
+    item.defenseBreakdown = item.reason || item.totalReason
+      ? { reason: item.totalReason || item.reason }
+      : {
+        heading: `防御构成 · ${item.augment.enabled ? '已并入所选增幅估算' : '去符文基础值'}${item.mana ? '；护盾含魔力换盾' : ''}`,
+        values: Object.fromEntries(ATTRIBUTES.map((attribute, index) => [attribute.key, item.totalComponents[index]])),
+        note: `${item.augment.enabled ? `已计入增幅估算（${item.augment.label} · ${item.augment.tierName}，${item.augment.sockets} 孔，每孔 ${augmentPerSocketText(item.augment)}）；` : '未选择增幅估算，孔内增幅不计入；'}${item.mana ? `护盾另含魔力换盾估算（装备自身魔力 ${fmt(item.mana.equipment)}${item.mana.augmentSockets > 0 ? ` + 增幅魔力 ${fmt(item.mana.augmentMana)} = ${fmt(item.mana.equipment + item.mana.augmentMana)}` : '，孔内魔力符文不计入'} = 转换护盾 ${fmt(item.mana.converted)}，1 魔力 = 1 护盾，不计品质与防御增幅）；` : ''}不含角色加成与其他词缀。`,
+      };
     return item;
   }
   function calculate(item) {
@@ -470,11 +553,37 @@
     // 与参考脚本一样，只处理已收录的防御 ID；其他符文不参与反推，也不阻止计算。
     const invalidDefenseRune = item.mods.find(mod => mod.type === 'rune' && [DEFENSE_RUNE, WARD_RUNE].includes(mod.id) && mod.percent === null);
     if (invalidDefenseRune) { item.reason = `已收录防御符文百分比无法解析：${invalidDefenseRune.text}`; return; }
+    // 增幅：防御百分比与魔力互斥，可全部取消；假定补孔只用于显示，特殊孔从可用孔中扣除。
+    const availableSockets = item.socketDisplay.supplemented ? 0 : item.socketDisplay.count;
+    const augmentSockets = armourAugmentKey ? Math.max(0, availableSockets - armourSpecialSockets) : 0;
+    const defenseAugmentSockets = armourAugmentKey === 'defense' ? augmentSockets : 0;
+    const manaAugmentSockets = armourAugmentKey === 'mana' ? augmentSockets : 0;
+    const manaAugment = armourAugmentKey === 'mana';
+    // 增幅效果倍率：与武器同口径，RUNE_EFFECT_IDS 相加后每孔数值只乘一次，默认向下取整。
+    // 用户页面诊断（8ca0437a…）：装备「增加60%镶嵌的物品效果」下，完美防御符文显示 32%（20% × 1.6）、
+    // 完美魔力符文显示 +80（50 × 1.6），与交易页词缀数值一致。
+    const runeEffectMods = item.mods.filter(mod => RUNE_EFFECT_IDS.has(mod.id));
+    const runeEffectMultiplier = 1 + runeEffectMods.reduce((sum, mod) => sum + (mod.percent ?? 0), 0);
+    const runeEffectValid = !runeEffectMods.some(mod => mod.percent === null) && runeEffectMultiplier > 0;
+    if (armourAugmentKey && !runeEffectValid) {
+      item.totalReason = runeEffectMods.some(mod => mod.percent === null) ? '装备的增幅效果倍率无法解析，无法估算新增增幅' : '装备的增幅效果倍率系数无效，无法估算新增增幅';
+    }
+    const defensePerSocket = Math.floor(DEFENSE_AUGMENT_PER_SOCKET[armourTierIndex] * runeEffectMultiplier * 100) / 100;
+    const manaPerSocket = Math.floor(MANA_AUGMENT_PER_SOCKET[armourTierIndex] * runeEffectMultiplier);
+    item.augment = {
+      key: armourAugmentKey, label: manaAugment ? '魔力' : '防御百分比', tierName: AUGMENT_TIERS[armourTierIndex],
+      base: manaAugment ? MANA_AUGMENT_PER_SOCKET[armourTierIndex] : DEFENSE_AUGMENT_PER_SOCKET[armourTierIndex],
+      perSocket: manaAugment ? manaPerSocket : defensePerSocket,
+      multiplier: runeEffectMultiplier, unit: manaAugment ? 'flat' : 'percent',
+      available: availableSockets, specialSockets: armourSpecialSockets, sockets: augmentSockets, enabled: Boolean(armourAugmentKey),
+    };
     const targetQuality = Math.max(item.quality, 20);
-    let total = 0;
+    let totalWithAugment = 0;
+    let augmentValid = !item.totalReason;
+    if (armourAugmentKey) item.formulas.push(`增幅每孔数值：${augmentPerSocketText(item.augment)}；可用孔 ${availableSockets} − 特殊孔 ${armourSpecialSockets} = ${augmentSockets} 孔`);
     for (const [index, attribute] of ATTRIBUTES.entries()) {
       const observed = item.values[index];
-      if (observed === null) { item.components.push(0); for (const maximum of item.maximums) maximum.components.push(0); continue; }
+      if (observed === null) { item.totalComponents.push(0); continue; }
       const relevant = item.mods.filter(mod => attribute.ids.includes(mod.id) && LOCAL_TYPES.has(mod.type));
       const equipmentPercent = relevant.reduce((sum, mod) => sum + (mod.percent ?? 0), 0);
       const runeId = attribute.key === 'ward' ? WARD_RUNE : DEFENSE_RUNE;
@@ -486,19 +595,16 @@
         }
         if (runePercent === 0) {
           const normalized = observed * ((1 + targetQuality / 100) / (1 + item.quality / 100));
-          item.components.push(normalized);
-          total += normalized;
           item.formulas.push(`保护：无保护百分比符文，装备增幅在分子/分母抵消；基础防御 = ${fmt(observed)} × (1 + ${fmt(targetQuality)}/100) ÷ (1 + ${fmt(item.quality)}/100) = ${fmt(normalized)}。不臆测裸基础或局部词缀归类。`);
-          for (const maximum of item.maximums) {
-            const targetRunePercent = item.socketDisplay.count * maximum.perSocket;
-            if (uncertainPercent && targetRunePercent > 0) {
-              maximum.reason = '保护装备百分比的局部/全局归类未验证，无法估算增加孔内防御增幅后的保护';
-            } else {
-              const value = normalized * (1 + targetRunePercent);
-              maximum.components.push(value);
-              maximum.total += value;
-              maximum.formulas.push(`保护：最高防御 = ${fmt(normalized)} × (1 + ${item.socketDisplay.count} × ${fmt(maximum.perSocket * 100)}/100) = ${fmt(value)}（按指定品质/孔增幅模型估算）`);
-            }
+          if (defenseAugmentSockets > 0 && uncertainPercent) {
+            augmentValid = false;
+            item.totalReason = '保护装备百分比的局部/全局归类未验证，无法估算增加孔内防御增幅后的保护';
+            item.totalComponents.push(0);
+          } else {
+            const value = normalized * (1 + defenseAugmentSockets * defensePerSocket);
+            item.totalComponents.push(value);
+            totalWithAugment += value;
+            if (defenseAugmentSockets > 0) item.formulas.push(`保护：含防御增幅估算 = ${fmt(normalized)} × (1 + ${defenseAugmentSockets} × ${fmt(defensePerSocket * 100)}/100) = ${fmt(value)}（按指定品质/孔增幅模型估算）`);
           }
           continue;
         }
@@ -510,23 +616,37 @@
       // shared factors before multiplying so unchanged values retain exact ties.
       const normalized = observed * (((1 + equipmentPercent) * (1 + targetQuality / 100)) / denominator);
       if (!Number.isFinite(normalized)) { item.reason = '防御计算结果无效'; return; }
-      item.components.push(normalized);
-      total += normalized;
       item.formulas.push(`${attribute.label}：裸基础 = ${fmt(observed)} ÷ (1 + ${fmt(item.quality)}/100) ÷ (1 + ${fmt(equipmentPercent * 100)}/100 + ${fmt(runePercent * 100)}/100) = ${fmt(rawBase)}；基础防御 = 裸基础 × (1 + ${fmt(equipmentPercent * 100)}/100) × (1 + ${fmt(targetQuality)}/100) = ${fmt(normalized)}`);
-      for (const maximum of item.maximums) {
-        const targetRunePercent = item.socketDisplay.count * maximum.perSocket;
-        const value = observed * (((1 + equipmentPercent + targetRunePercent) * (1 + targetQuality / 100)) / denominator);
-        if (!Number.isFinite(value)) {
-          maximum.reason = '最高防御计算结果无效';
-        } else {
-          maximum.components.push(value);
-          maximum.total += value;
-          maximum.formulas.push(`${attribute.label}：最高防御 = 裸基础 × (1 + ${fmt(equipmentPercent * 100)}/100 + ${item.socketDisplay.count} × ${fmt(maximum.perSocket * 100)}/100) × (1 + ${fmt(targetQuality)}/100) = ${fmt(value)}`);
-        }
+      // 未选增幅时 defenseAugmentSockets 为 0，结果与基础值逐位相同，保持原数值并列关系不变。
+      const augmented = observed * (((1 + equipmentPercent + defenseAugmentSockets * defensePerSocket) * (1 + targetQuality / 100)) / denominator);
+      if (!Number.isFinite(augmented)) {
+        augmentValid = false;
+        item.totalReason = '防御增幅计算结果无效';
+        item.totalComponents.push(0);
+      } else {
+        item.totalComponents.push(augmented);
+        totalWithAugment += augmented;
+        if (defenseAugmentSockets > 0) item.formulas.push(`${attribute.label}：含防御增幅估算 = 裸基础 × (1 + ${fmt(equipmentPercent * 100)}/100 + ${defenseAugmentSockets} × ${fmt(defensePerSocket * 100)}/100) × (1 + ${fmt(targetQuality)}/100) = ${fmt(augmented)}`);
       }
     }
-    item.normalized = total;
-    for (const maximum of item.maximums) if (!maximum.reason) maximum.value = maximum.total;
+    // 魔力换盾：装备自身魔力（不含孔内符文）加所选魔力增幅，在防御计算完成后按 1 魔力 = 1 护盾并入护盾分量。
+    // 孔内增幅默认不计入；选择「魔力」增幅只加入所选档位的估算，不与原有孔内魔力叠加。
+    // 转换护盾不参与品质、装备百分比与孔内防御增幅，假定补孔同样不提供增幅魔力。
+    if (armourManaShield) {
+      const mana = readEquipmentMana(item.mods);
+      if (mana.invalid) {
+        augmentValid = false;
+        if (!item.totalReason) item.totalReason = `已收录魔力/属性词缀数值无法解析：${mana.invalid}`;
+      } else {
+        const augmentMana = manaAugmentSockets * manaPerSocket;
+        const converted = (mana.equipment + augmentMana) * MANA_SHIELD_PER_MANA;
+        const esIndex = ATTRIBUTES.findIndex(attribute => attribute.key === 'es');
+        item.totalComponents[esIndex] += converted;
+        totalWithAugment += converted;
+        item.mana = { totals: mana.totals, affix: mana.affix, equipment: mana.equipment, augmentSockets: manaAugmentSockets, perSocket: manaPerSocket, augmentMana, converted };
+      }
+    }
+    item.total = augmentValid ? totalWithAugment : null;
   }
 
   const host = document.createElement('div');
@@ -556,10 +676,10 @@
       .toolbar { display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:8px; }
       .toolbar-actions { display:flex; gap:4px; }
       .detail-option { display:flex; align-items:center; gap:4px; font-size:12px; cursor:pointer; }
-      /* 分三行固定分组：计算攻速 / 特殊孔＋档位 / 增幅类型；避免单行过宽把面板撑开。 */
-      .weapon-options { display:flex; flex-direction:column; gap:6px; margin-top:8px; }
+      /* 分三行固定分组：显示项 / 特殊孔＋档位 / 增幅类型；避免单行过宽把面板撑开。 */
+      .mode-options { display:flex; flex-direction:column; gap:6px; margin-top:8px; }
       .option-row { display:flex; flex-wrap:wrap; align-items:center; gap:8px; }
-      .weapon-options select { font:inherit; color:inherit; background:#282f3a; border:1px solid #515a68; border-radius:5px; padding:2px 4px; cursor:pointer; }
+      .mode-options select { font:inherit; color:inherit; background:#282f3a; border:1px solid #515a68; border-radius:5px; padding:2px 4px; cursor:pointer; }
       .mode-switch { display:flex; flex-shrink:0; gap:4px; padding:8px; border-bottom:1px solid #343c48; }
       .mode-switch button { flex:1; }
       .mode-switch button[aria-pressed="true"] { color:#e7c889; border-color:#e7c889; background:#353020; }
@@ -568,7 +688,6 @@
       table { width:max-content; min-width:100%; table-layout:auto; border-collapse:collapse; font-variant-numeric:tabular-nums; color:inherit; }
       th, td { padding:6px 3px; border-bottom:1px solid #343c48; text-align:right; vertical-align:middle; white-space:nowrap; }
       th { color:#c0c7d2; font-size:12px; }
-      td.maximum { font-size:12px; }
       .sort { border:0; background:none; padding:0; width:100%; text-align:inherit; color:inherit; }
       .locate { border:0; background:none; padding:0; text-align:right; white-space:nowrap; color:#e7c889; text-decoration:underline dotted; text-underline-offset:3px; }
       /* 整行可点击定位交易页条目。 */
@@ -579,8 +698,7 @@
       .state-corrupted { color:#ff6b6b; }
       .state-sanctified { color:#ffe066; }
       .state-mirrored { color:#c084fc; }
-      .normalized, .maximum, .totalDamage, .damagePerPrice { color:#b6dfaa; }
-      .normalized.warning, .maximum.warning, td.warning { color:#f5c786; }
+      .total, .totalDamage, .damagePerPrice, .defensePerPrice { color:#b6dfaa; }
       tr.has-details td { border-bottom:0; }
       tr.defense-details td { width:auto; padding-top:0; text-align:center; color:#aeb7c5; font-size:12px; }
       tr.source-hovered td { background:#403721; box-shadow:inset 0 1px #75613e,inset 0 -1px #75613e; }
@@ -590,26 +708,45 @@
       .detail-ar { color:#ff9292; }
       .detail-ev { color:#91db91; }
       .detail-es { color:#85baff; }
+      .detail-ward { color:#c9a0ff; }
       tr.weapon-details td { width:auto; padding-top:0; text-align:center; color:#aeb7c5; font-size:12px; }
-      /* 伤害占比条：固定 160px、居中；各段按未取整点伤比例分配，颜色见 DAMAGE_BREAKDOWN。 */
+      /* 构成占比条：固定 160px、居中；各段按未取整数值比例分配，颜色见 DAMAGE_BREAKDOWN / DEFENSE_BREAKDOWN。 */
       .damage-bar { display:flex; width:160px; max-width:100%; height:6px; margin:0 auto; background:#0f1217; border:1px solid #515a68; border-radius:3px; overflow:hidden; }
       .damage-bar:focus-visible { outline:2px solid #e7c889; outline-offset:2px; }
       .damage-segment { flex:1 1 0; min-width:0; }
       .damage-note { display:inline-block; width:160px; white-space:normal; }
-      /* 五类明细数值：按 DAMAGE_BREAKDOWN 颜色显示正数项，位于占比条上方；允许换行。 */
+      /* 明细数值：按 DAMAGE_BREAKDOWN / DEFENSE_BREAKDOWN 颜色显示正数项，位于占比条上方；允许换行。 */
       .damage-values { margin:0 0 4px; white-space:normal; }
       @media (max-width:450px) { .panel-controls { padding:6px; } .table-scroll { padding:0 6px 6px; } th,td { padding:6px 2px; font-size:12px; } }
     </style>
     <button id="launcher" type="button" aria-label="展开装备排序浮窗" aria-expanded="false" aria-controls="panel" title="点击展开装备排序，拖动移动">POE</button>
     <section id="panel" class="panel" aria-label="装备防御与武器伤害排序浮窗" hidden>
-      <header><strong>装备防御 · 高阶/完美降序</strong><button id="collapse" type="button" aria-expanded="false" aria-controls="panel">收起</button></header>
+      <header><strong>装备防御 · 总防御降序</strong><button id="collapse" type="button" aria-expanded="false" aria-controls="panel">收起</button></header>
       <nav class="mode-switch" aria-label="装备类型"><button type="button" data-mode="armour" aria-pressed="true">护甲</button><button type="button" data-mode="weapon" aria-pressed="false">武器</button></nav>
       <div id="body" class="body">
         <div class="panel-controls">
         <div class="toolbar"><span id="status" class="muted" role="status"></span><div class="toolbar-actions"><button id="back-top" type="button" title="回到交易页面顶部">回顶部</button><button id="locate-more" type="button" title="滚动并聚焦交易页原生加载按钮，不自动加载">定位加载更多</button><button id="refresh" type="button">刷新</button></div></div>
         <div id="locate-status" class="muted" role="status" hidden></div>
-        <label class="detail-option"><input id="show-details" type="checkbox">显示详细属性</label>
-        <div id="weapon-options" class="weapon-options" hidden>
+        <div id="armour-options" class="mode-options">
+        <div class="option-row">
+        <label class="detail-option" title="在护甲表格显示「性价比」列（位于「总防御」右侧）：当前总防御 ÷ 标价金额，保留2位小数；仅按金额，不换算货币。总防御随增幅与魔力换盾估算变化。"><input id="armour-per-price" type="checkbox">显示性价比</label>
+        <label class="detail-option" title="勾选后在每行护甲下方列出护甲 / 闪避 / 护盾 / 保护 的处理后数值（与占比条同源，含已选增幅与魔力换盾估算，未选增幅时不含孔内增幅）；为 0 或未读取到的类型不显示。"><input id="armour-show-details" type="checkbox">显示详细数值</label>
+        </div>
+        <div class="option-row">
+        <label class="detail-option" title="预留给特殊符文的孔数；估算增幅时从可用孔中扣除，默认 0">特殊孔<select id="armour-special-sockets" aria-label="特殊孔数量"></select></label>
+        <span class="muted">增幅：</span>
+        <label class="detail-option" title="增幅估算档位：高阶符文每孔 18%（防御）或 +40 魔力；仅在勾选「防御百分比」或「魔力」后影响结果"><input type="radio" name="armour-augment-tier" data-armour-tier="high" checked>高阶</label>
+        <label class="detail-option" title="增幅估算档位：完美符文每孔 20%（防御）或 +50 魔力；仅在勾选「防御百分比」或「魔力」后影响结果"><input type="radio" name="armour-augment-tier" data-armour-tier="perfect">完美</label>
+        </div>
+        <div class="option-row">
+        <label class="detail-option" title="勾选后估算孔内防御增幅：增加护甲、闪避、护盾与保护；与装备自身增幅相加，先移除原有防御符文再重算，直接并入「总防御」及各类型明细；每孔数值按装备的镶嵌增幅效果倍率向下取整。未勾选时「总防御」不含任何孔内增幅。保护存在局部/全局归类疑义时拒绝估算。假定补孔不参与计算。"><input id="armour-augment" type="checkbox">防御百分比</label>
+        <label class="detail-option" title="勾选后按孔插魔力符文估算：高阶每孔 +40、完美每孔 +50 最大魔力（护甲行数值），再乘装备的镶嵌增幅效果倍率向下取整。孔内原有魔力默认不计入，勾选后按可用孔加入所选档位，不叠加原有孔内魔力。与「防御百分比」互斥，两者可都不选；需先开启「魔力换盾」才生效。"><input id="armour-mana-augment" type="checkbox" disabled>魔力</label>
+        </div>
+        <div class="option-row">
+        <label class="detail-option" title="把装备自身魔力与所选魔力增幅按 1 魔力 = 1 护盾并入护盾与总防御：装备自身魔力 = 非孔内最大魔力词缀 + 2 × (非孔内智慧 + 全能力)，不含孔内符文，勾选「魔力」后才按所选档位加入；命定 Bonded、pseudo 汇总与角色/天赋魔力不计，也不计品质与防御增幅。按指定模型估算，不视为已验证游戏机制。"><input id="armour-mana-shield" type="checkbox">魔力换盾</label>
+        </div>
+        </div>
+        <div id="weapon-options" class="mode-options" hidden>
         <div class="option-row">
         <label class="detail-option" title="勾选后总伤 = 处理后的总点伤 × 每秒攻击次数（含已选增幅估算）；不勾选时总伤为平均单次伤害。攻速缺失或无效时总伤显示计算不可得。"><input id="count-aps" type="checkbox">计算攻速</label>
         <label class="detail-option" title="在武器表格显示「性价比」列（位于「总伤」右侧）：当前总伤 ÷ 标价金额，保留2位小数；仅按金额，不换算货币。总伤随「计算攻速」与增幅估算变化。"><input id="show-damage-per-price" type="checkbox">显示性价比</label>
@@ -643,21 +780,27 @@
   let specialSockets = 0;
   let countAttacksPerSecond = false;
   let showDamagePerPrice = false;
+  let armourTierIndex = 0;
+  let armourSpecialSockets = 0;
+  let armourAugmentKey = null;
+  let armourManaShield = false;
+  let armourShowPerPrice = false;
   let firstResultId = null;
   let manualMode = false;
-  let sortKey = 'maximum';
+  let sortKey = 'total';
   let sortDirection = 'descending';
   const modeSorting = {
-    armour: { key: 'maximum', direction: 'descending' },
+    armour: { key: 'total', direction: 'descending' },
     weapon: { key: 'totalDamage', direction: 'descending' },
   };
-  const ARMOUR_COLUMNS = [['current', '当前防御'], ['normalized', '基础防御'], ['maximum', '高阶/完美'], ['sockets', '孔'], ['price', '价格']];
+  const ARMOUR_COLUMNS = [['current', '当前防御'], ['total', '总防御'], ['sockets', '孔'], ['price', '价格']];
   const WEAPON_COLUMNS = [['totalDamage', '总伤'], ['physicalDamage', '物理'], ['elementalDamage', '元素'], ['chaosDamage', '混沌'], ['sockets', '孔'], ['price', '价格']];
-  // 性价比：勾选后插在「总伤」右侧；值为当前总伤 ÷ 标价金额（沿用仅按金额、不换算货币口径）。
+  // 性价比：勾选后插在「总伤」/「总防御」右侧；值为当前总伤（或总防御）÷ 标价金额（沿用仅按金额、不换算货币口径）。
   const DAMAGE_PER_PRICE_COLUMN = ['damagePerPrice', '性价比'];
-  // 增幅不单独成列：勾选后数值直接并入对应点伤列与总伤（见 readWeapon）。
+  const DEFENSE_PER_PRICE_COLUMN = ['defensePerPrice', '性价比'];
+  // 增幅不单独成列：勾选后数值直接并入对应点伤列与总伤（见 readWeapon）或总防御（见 calculate）。
   const activeColumns = () => mode !== 'weapon'
-    ? ARMOUR_COLUMNS
+    ? armourShowPerPrice ? [ARMOUR_COLUMNS[0], ARMOUR_COLUMNS[1], DEFENSE_PER_PRICE_COLUMN, ...ARMOUR_COLUMNS.slice(2)] : ARMOUR_COLUMNS
     : showDamagePerPrice ? [WEAPON_COLUMNS[0], DAMAGE_PER_PRICE_COLUMN, ...WEAPON_COLUMNS.slice(1)] : WEAPON_COLUMNS;
   const headerRow = root.querySelector('thead tr');
   const panelRows = new Map();
@@ -697,7 +840,7 @@
     if (sortKey === 'sockets') return item.socketDisplay.count;
     if (sortKey === 'price') return number(item.price);
     if (sortKey === 'damagePerPrice') return item.damagePerPrice;
-    if (sortKey === 'maximum') return item.maximums[0].value;
+    if (sortKey === 'defensePerPrice') return item.defensePerPrice;
     return item[sortKey];
   }
   function updateSortHeaders() {
@@ -728,13 +871,44 @@
       const nextDirection = active && sortDirection === 'descending' || !active && key === 'price' ? '升序' : '降序';
       button.textContent = `${label}${active ? sortDirection === 'descending' ? ' ↓' : ' ↑' : ''}`;
       button.parentElement.setAttribute('aria-sort', active ? sortDirection : 'none');
-      button.title = `${label}排序，点击按${nextDirection}${key === 'price' ? '（仅按金额，不换算货币）' : key === 'maximum' ? '（按左侧18%未取整值）' : key === 'totalDamage' ? `（${countAttacksPerSecond ? '处理后总点伤 × 攻速' : '平均单次总伤'}，按未取整值）` : key === 'damagePerPrice' ? '（总伤 ÷ 价格金额，仅按金额不换算货币，按未取整值）' : ''}`;
+      const armourEstimate = [armourAugmentKey ? '已选增幅' : '', armourManaShield ? '魔力换盾' : ''].filter(Boolean).join('与');
+      button.title = `${label}排序，点击按${nextDirection}${key === 'price' ? '（仅按金额，不换算货币）' : key === 'total' ? `（${armourEstimate ? `含${armourEstimate}估算，` : ''}按未取整值）` : key === 'totalDamage' ? `（${countAttacksPerSecond ? '处理后总点伤 × 攻速' : '平均单次总伤'}，按未取整值）` : key === 'damagePerPrice' ? '（总伤 ÷ 价格金额，仅按金额不换算货币，按未取整值）' : key === 'defensePerPrice' ? '（总防御 ÷ 价格金额，仅按金额不换算货币，按未取整值）' : ''}`;
       button.setAttribute('aria-label', button.title);
       if (active) root.querySelector('header strong').textContent = `${mode === 'weapon' ? '武器伤害' : '装备防御'} · ${label}${sortDirection === 'descending' ? '降序' : '升序'}`;
     }
   }
   function breakdown(values) {
     return ATTRIBUTES.map((attribute, index) => `${attribute.label} ${fmt(values[index] ?? 0)}`).join(' + ');
+  }
+  // 占比条：武器伤害与护甲防御共用同一渲染。values 为空时显示失败原因、全零时显示空说明，
+  // 不用部分比例冒充构成；各段按未取整数值比例分配。
+  function breakdownBar(entries, values, { heading, note, empty, failure }) {
+    const total = values ? entries.reduce((sum, entry) => sum + (values[entry.key] ?? 0), 0) : 0;
+    if (!(total > 0)) {
+      const span = document.createElement('span');
+      span.className = 'damage-note';
+      span.textContent = values ? empty : failure;
+      return span;
+    }
+    const lines = [heading];
+    const bar = document.createElement('div');
+    bar.className = 'damage-bar';
+    bar.tabIndex = 0;
+    bar.setAttribute('role', 'img');
+    for (const entry of entries) {
+      const value = values[entry.key];
+      if (!(value > 0)) continue;
+      lines.push(`${entry.label}：${fmt(value)}（${Math.round(value / total * 100)}%）`);
+      const segment = document.createElement('span');
+      segment.className = 'damage-segment';
+      segment.style.backgroundColor = entry.color;
+      segment.style.flexGrow = String(value);
+      bar.append(segment);
+    }
+    lines.push(note);
+    bar.title = lines.join('\n');
+    bar.setAttribute('aria-label', lines.join('；'));
+    return bar;
   }
   function refresh() {
     const sourceRows = [...document.querySelectorAll(ROW_SELECTOR)].filter(row => row.querySelector(`${WEAPON_SELECTOR}, [data-field="ar"], [data-field="ev"], [data-field="es"], [data-field="ward"], .item-popup, .itemPopup, .item-popup__header--item`));
@@ -751,7 +925,7 @@
     const rows = sourceRows.filter(row => mode === 'weapon' ? row.querySelector(WEAPON_SELECTOR) : !row.querySelector(WEAPON_SELECTOR));
     const items = rows.map(mode === 'weapon' ? readWeapon : readEquipment);
     root.querySelector('table').classList.toggle('weapon', mode === 'weapon');
-    get('show-details').parentElement.hidden = mode === 'weapon';
+    get('armour-options').hidden = mode !== 'armour';
     get('weapon-options').hidden = mode !== 'weapon';
     items.sort((a, b) => {
       const left = sortValue(a);
@@ -781,7 +955,7 @@
       }
       tr.append(statesCell);
       const cellValues = {
-        current: item.current, normalized: item.normalized, maximum: item.maximums?.[0]?.value ?? null,
+        current: item.current, total: item.total, defensePerPrice: item.defensePerPrice,
         totalDamage: item.totalDamage,
         damagePerPrice: item.damagePerPrice,
         physicalDamage: item.physicalDamage, elementalDamage: item.elementalDamage, chaosDamage: item.chaosDamage,
@@ -791,7 +965,7 @@
       for (const [key, value] of cells) {
         const td = document.createElement('td');
         td.className = key;
-        td.textContent = key === 'price' ? value : key === 'normalized' || key === 'maximum' ? value === null ? '计算不可得' : fmtDefense(value) : fmt(value);
+        td.textContent = key === 'price' ? value : key === 'total' ? Number.isFinite(value) ? fmtDefense(value) : '计算不可得' : fmt(value);
         if (key === 'price') {
           const stateText = item.states.map(state => state.label).join('、');
           const button = document.createElement('button');
@@ -818,14 +992,14 @@
           td.title = `可用/总共：左侧为可用孔，右侧为总孔\n${item.socketDisplay.title}`;
         }
         if (key === 'current') td.title = breakdown(item.values);
-        if (key === 'normalized') {
-          td.title = item.reason || `${breakdown(item.components)}\n品质 ${fmt(item.quality)}% → ${fmt(Math.max(item.quality, 20))}%\n${item.formulas.join('\n')}\n合计 ${fmt(item.normalized)}，向下取整显示 ${fmtDefense(item.normalized)}；排序使用未取整值。\n裸基础是中间反推量；列表“基础防御”保留装备增幅，不含符文。`;
-          if (item.reason) td.classList.add('warning');
+        if (key === 'total') {
+          td.title = item.totalTitle;
+          if (!Number.isFinite(value)) td.classList.add('warning');
         }
-        if (key === 'maximum') {
-          td.textContent = item.maximums.every(maximum => maximum.value === null) ? '计算不可得' : item.maximums.map(maximum => maximum.value === null ? '计算不可得' : fmtDefense(maximum.value)).join('/');
-          td.title = item.reason || `${item.socketDisplay.title}\n左侧高阶每孔18%，右侧完美每孔20%；与装备自身增幅相加，先移除原符文再重算。\n${item.maximums.map(maximum => `每孔${fmt(maximum.perSocket * 100)}%：\n${maximum.reason || `${breakdown(maximum.components)}\n${maximum.formulas.join('\n')}\n合计 ${fmt(maximum.value)}，向下取整显示 ${fmtDefense(maximum.value)}`}`).join('\n\n')}\n高阶/完美排序使用左侧18%的未取整值。`;
-          if (item.reason || item.maximums.some(maximum => maximum.reason)) td.classList.add('warning');
+        if (key === 'defensePerPrice') {
+          td.textContent = Number.isFinite(value) ? fmtRatio(value) : '计算不可得';
+          td.title = item.defensePerPriceTitle;
+          if (!Number.isFinite(value)) td.classList.add('warning');
         }
         tr.append(td);
       }
@@ -838,8 +1012,7 @@
         const detailCell = document.createElement('td');
         detailCell.colSpan = tr.children.length;
         const types = item.breakdown.types;
-        const total = types ? DAMAGE_BREAKDOWN.reduce((sum, entry) => sum + types[entry.key], 0) : 0;
-        // 可选明细：按固定顺序与配色列出正数项；无需猜测，为 0 或不可得的类型不显示。
+        // 可选明细：按固定顺序与配色列出正数项；为 0 或不可得的类型不显示。
         if (types && get('show-weapon-details').checked) {
           const line = document.createElement('div');
           line.className = 'damage-values';
@@ -855,58 +1028,52 @@
           }
           if (line.childNodes.length) detailCell.append(line);
         }
-        if (types && total > 0) {
-          const lines = ['武器伤害构成 · 处理后平均单次点伤，不乘攻速'];
-          const bar = document.createElement('div');
-          bar.className = 'damage-bar';
-          bar.tabIndex = 0;
-          bar.setAttribute('role', 'img');
-          for (const entry of DAMAGE_BREAKDOWN) {
-            const value = types[entry.key];
-            if (!(value > 0)) continue;
-            lines.push(`${entry.label}：${fmt(value)}（${Math.round(value / total * 100)}%）`);
-            const segment = document.createElement('span');
-            segment.className = 'damage-segment';
-            segment.style.backgroundColor = entry.color;
-            segment.style.flexGrow = String(value);
-            bar.append(segment);
-          }
-          lines.push(item.breakdown.note);
-          bar.title = lines.join('\n');
-          bar.setAttribute('aria-label', lines.join('；'));
-          detailCell.append(bar);
-        } else {
-          const note = document.createElement('span');
-          note.className = 'damage-note';
-          note.textContent = types ? '无伤害占比' : `占比不可得：${item.breakdown.reason}`;
-          detailCell.append(note);
-        }
+        detailCell.append(breakdownBar(DAMAGE_BREAKDOWN, types, {
+          heading: '武器伤害构成 · 处理后平均单次点伤，不乘攻速',
+          note: types ? item.breakdown.note : '',
+          empty: '无伤害占比',
+          failure: `占比不可得：${item.breakdown.reason}`,
+        }));
         detailRow.append(detailCell);
         fragment.append(detailRow);
       }
-      if (mode === 'armour' && get('show-details').checked && item.values.slice(0, 3).some(Number.isFinite)) {
+      if (mode === 'armour' && item.defenseBreakdown) {
         tr.classList.add('has-details');
         const detailRow = document.createElement('tr');
         detailRow.className = 'defense-details';
         detailRow.addEventListener('click', () => locateSourceRow(item.row));
         const detailCell = document.createElement('td');
         detailCell.colSpan = tr.children.length;
-        for (const [key, label, index] of [['ar', 'AR', 1], ['ev', 'EV', 2], ['es', 'ES', 0]]) {
-          if (!Number.isFinite(item.values[index])) continue;
-          if (detailCell.childNodes.length) detailCell.append(' · ');
-          const value = document.createElement('span');
-          value.className = `detail-${key}`;
-          value.textContent = `${label} ${fmt(item.values[index])}`;
-          detailCell.append(value);
+        const values = item.defenseBreakdown.values;
+        // 可选明细：按固定顺序与配色列出正数项；为 0 或未读取到的类型不显示。
+        if (values && get('armour-show-details').checked) {
+          const line = document.createElement('div');
+          line.className = 'damage-values';
+          line.title = '各类型防御最终值，与占比条同源；选增幅或魔力换盾时含对应估算，未选增幅时不含孔内增幅。';
+          for (const entry of DEFENSE_BREAKDOWN) {
+            const value = values[entry.key];
+            if (!(value > 0)) continue;
+            if (line.childNodes.length) line.append(' · ');
+            const valueElement = document.createElement('span');
+            valueElement.className = `detail-${entry.key}`;
+            valueElement.textContent = `${entry.label} ${fmt(value)}`;
+            line.append(valueElement);
+          }
+          if (line.childNodes.length) detailCell.append(line);
         }
-        detailCell.title = '当前装备面板的护甲 / 闪避 / 护盾；未读取到数值的类型隐藏。';
+        detailCell.append(breakdownBar(DEFENSE_BREAKDOWN, values, {
+          heading: item.defenseBreakdown.heading || '',
+          note: values ? item.defenseBreakdown.note : '',
+          empty: '无防御占比',
+          failure: `占比不可得：${item.defenseBreakdown.reason}`,
+        }));
         detailRow.append(detailCell);
         fragment.append(detailRow);
       }
     }
     tbody.replaceChildren(fragment);
     highlightSourceRow(hoveredSourceRow?.isConnected ? hoveredSourceRow : null);
-    get('status').textContent = items.length ? `已加载 ${items.length} 件 · 可计算 ${items.filter(item => Number.isFinite(mode === 'weapon' ? item.totalDamage : item.normalized)).length} 件` : `尚未找到${mode === 'weapon' ? '武器' : '装备'}，请先搜索并加载交易结果。`;
+    get('status').textContent = items.length ? `已加载 ${items.length} 件 · 可计算 ${items.filter(item => Number.isFinite(mode === 'weapon' ? item.totalDamage : item.total)).length} 件` : `尚未找到${mode === 'weapon' ? '武器' : '装备'}，请先搜索并加载交易结果。`;
   }
   headerRow.addEventListener('click', event => {
     const button = event.target.closest('button[data-sort]');
@@ -925,8 +1092,18 @@
   }
   get('refresh').addEventListener('click', refresh);
   get('back-top').addEventListener('click', () => window.scrollTo({ top: 0, behavior: 'smooth' }));
-  get('show-details').addEventListener('change', refresh);
   get('show-weapon-details').addEventListener('change', refresh);
+  get('armour-show-details').addEventListener('change', refresh);
+  get('armour-per-price').addEventListener('change', event => {
+    armourShowPerPrice = event.target.checked;
+    // 取消勾选后该列不再存在；若正按它排序，回落到护甲默认总防御降序，避免不可见排序键。
+    if (!armourShowPerPrice && sortKey === 'defensePerPrice') {
+      sortKey = 'total';
+      sortDirection = 'descending';
+      modeSorting.armour = { key: sortKey, direction: sortDirection };
+    }
+    refresh();
+  });
   get('count-aps').addEventListener('change', event => {
     countAttacksPerSecond = event.target.checked;
     refresh();
@@ -959,18 +1136,50 @@
       refresh();
     });
   }
-  const specialSocketsSelect = get('special-sockets');
-  for (let count = 0; count <= 9; count++) {
-    const option = document.createElement('option');
-    option.value = String(count);
-    option.textContent = String(count);
-    specialSocketsSelect.append(option);
+  // 护甲增幅：「防御百分比」与「魔力」互斥，可全部取消；取消即回到去符文基础值。
+  const armourAugmentControls = { defense: get('armour-augment'), mana: get('armour-mana-augment') };
+  function setArmourAugment(key) {
+    armourAugmentKey = key;
+    for (const [name, control] of Object.entries(armourAugmentControls)) control.checked = name === key;
+    refresh();
   }
-  specialSocketsSelect.addEventListener('change', () => {
-    specialSockets = Math.min(9, Math.max(0, Math.trunc(Number(specialSocketsSelect.value)) || 0));
-    specialSocketsSelect.value = String(specialSockets);
+  for (const [key, control] of Object.entries(armourAugmentControls)) {
+    control.addEventListener('change', () => setArmourAugment(control.checked ? key : null));
+  }
+  // 「魔力换盾」：未开启时不提供魔力增幅；关闭时一并取消已选的魔力增幅，不偷偷切到防御百分比。
+  get('armour-mana-shield').addEventListener('change', event => {
+    armourManaShield = event.target.checked;
+    get('armour-mana-augment').disabled = !armourManaShield;
+    if (!armourManaShield && armourAugmentKey === 'mana') armourAugmentKey = null;
+    get('armour-mana-augment').checked = armourAugmentKey === 'mana';
     refresh();
   });
+  for (const control of root.querySelectorAll('[data-armour-tier]')) {
+    control.addEventListener('change', () => {
+      // 高阶/完美单选，始终保留一项；只重算所选档位。
+      if (!control.checked) return;
+      armourTierIndex = control.dataset.armourTier === 'perfect' ? 1 : 0;
+      refresh();
+    });
+  }
+  // 特殊孔下拉：武器与护甲各自独立，0–9；变更后立即重算。
+  function setupSpecialSockets(id, apply) {
+    const select = get(id);
+    for (let count = 0; count <= 9; count++) {
+      const option = document.createElement('option');
+      option.value = String(count);
+      option.textContent = String(count);
+      select.append(option);
+    }
+    select.addEventListener('change', () => {
+      const value = Math.min(9, Math.max(0, Math.trunc(Number(select.value)) || 0));
+      apply(value);
+      select.value = String(value);
+      refresh();
+    });
+  }
+  setupSpecialSockets('special-sockets', value => { specialSockets = value; });
+  setupSpecialSockets('armour-special-sockets', value => { armourSpecialSockets = value; });
   get('locate-more').addEventListener('click', () => {
     // 原生加载按钮类名参考 POE2交易助手；只定位，不调用 click 或发送请求。
     const visible = button => !button.closest('[hidden], [aria-hidden="true"]') && button.getClientRects().length > 0 && !['hidden', 'collapse'].includes(window.getComputedStyle(button).visibility) && !button.closest(ROW_SELECTOR);
