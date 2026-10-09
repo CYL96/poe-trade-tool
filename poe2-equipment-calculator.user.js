@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         POE2 装备防御与武器伤害排序浮窗
 // @namespace    poe-trade-tool
-// @version      2.4.4
-// @description  自动列出已加载装备，支持护甲防御、武器处理后总伤（可选按攻速）与孔内增幅点伤估算。
+// @version      2.5.0
+// @description  自动列出已加载装备，支持护甲防御、武器处理后总伤（可选按攻速、显示性价比）与孔内增幅点伤估算。
 // @match        https://www.pathofexile.com/trade2*
 // @match        https://poe.game.qq.com/trade2*
 // @run-at       document-idle
@@ -71,6 +71,7 @@
   // 不重复乘倍率；被倍率放大的其他局部增幅类型仍拒绝反推。新增增幅倍率按用户确认的默认向下取整计算。
   const VERIFIED_EFFECT_RUNE_IDS = new Set(['stat_3336890334']);
   const fmt = value => Number.isFinite(value) ? value.toLocaleString('zh-CN', { maximumFractionDigits: 2 }) : '—';
+  const fmtRatio = value => Number.isFinite(value) ? value.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : '—';
   const fmtDefense = value => Number.isFinite(value) ? fmt(Math.floor(value)) : '—';
   const text = element => (element?.textContent || '').replace(/\u00a0/g, ' ').trim();
   const number = value => {
@@ -270,6 +271,16 @@
       ? Number.isFinite(processedTotal) && validSpeed ? processedTotal * attacksPerSecond : null
       : processedTotal;
     damageValues.totalDamage = totalDamage;
+    // 性价比：除以标价金额（沿用「仅按金额，不换算货币」口径）；总伤、金额或攻速不可得时不计算。
+    const price = readPrice(row);
+    const priceAmount = number(price);
+    const damagePerPrice = Number.isFinite(totalDamage) && Number.isFinite(priceAmount) && priceAmount > 0 ? totalDamage / priceAmount : null;
+    const apsReason = countAttacksPerSecond && Number.isFinite(processedTotal) && !validSpeed ? '未读取到有效的每秒攻击次数' : '';
+    const damagePerPriceTitle = Number.isFinite(damagePerPrice)
+      ? `性价比 = 总伤 ${fmt(totalDamage)} ÷ 价格金额 ${fmt(priceAmount)} = ${fmtRatio(damagePerPrice)}（保留2位小数，排序使用未取整值）\n仅按标价金额，不换算货币；${countAttacksPerSecond ? '总伤已乘攻速' : '总伤为平均单次伤害'}，随增幅估算变化。`
+      : !Number.isFinite(priceAmount) || priceAmount <= 0
+        ? '未读取到有效的价格金额，无法计算性价比。'
+        : `总伤不可得${damage.reason || apsReason ? `（${damage.reason || apsReason}）` : ''}，无法计算性价比。`;
     const apsSuffix = countAttacksPerSecond
       ? Number.isFinite(processedTotal)
         ? validSpeed ? `\n计算攻速：总伤 = ${fmt(processedTotal)} × ${fmt(attacksPerSecond)} = ${fmt(totalDamage)}（每秒伤害）` : '\n计算攻速：未读取到有效的每秒攻击次数，总伤不可得'
@@ -286,7 +297,9 @@
       row, index, ...damageValues,
       socketDisplay: display,
       states,
-      price: readPrice(row),
+      price,
+      damagePerPrice,
+      damagePerPriceTitle,
       weaponTitles,
     };
   }
@@ -501,7 +514,7 @@
       .state-corrupted { color:#ff6b6b; }
       .state-sanctified { color:#ffe066; }
       .state-mirrored { color:#c084fc; }
-      .normalized, .maximum, .totalDamage { color:#b6dfaa; }
+      .normalized, .maximum, .totalDamage, .damagePerPrice { color:#b6dfaa; }
       .normalized.warning, .maximum.warning, td.warning { color:#f5c786; }
       tr.has-details td { border-bottom:0; }
       tr.defense-details td { width:auto; padding-top:0; text-align:center; color:#aeb7c5; font-size:12px; }
@@ -523,6 +536,7 @@
         <div id="weapon-options" class="weapon-options" hidden>
         <div class="option-row">
         <label class="detail-option" title="勾选后总伤 = 处理后的总点伤 × 每秒攻击次数（含已选增幅估算）；不勾选时总伤为平均单次伤害。攻速缺失或无效时总伤显示计算不可得。"><input id="count-aps" type="checkbox">计算攻速</label>
+        <label class="detail-option" title="在武器表格显示「性价比」列（位于「总伤」右侧）：当前总伤 ÷ 标价金额，保留2位小数；仅按金额，不换算货币。总伤随「计算攻速」与增幅估算变化。"><input id="show-damage-per-price" type="checkbox">显示性价比</label>
         </div>
         <div class="option-row">
         <label class="detail-option" title="预留给特殊符文的孔数；估算增幅时从可用孔中扣除，默认 0">特殊孔<select id="special-sockets" aria-label="特殊孔数量"></select></label>
@@ -551,6 +565,7 @@
   let augmentTierIndex = 0;
   let specialSockets = 0;
   let countAttacksPerSecond = false;
+  let showDamagePerPrice = false;
   let firstResultId = null;
   let manualMode = false;
   let sortKey = 'maximum';
@@ -561,8 +576,12 @@
   };
   const ARMOUR_COLUMNS = [['current', '当前防御'], ['normalized', '基础防御'], ['maximum', '高阶/完美'], ['sockets', '孔'], ['price', '价格']];
   const WEAPON_COLUMNS = [['totalDamage', '总伤'], ['physicalDamage', '物理'], ['elementalDamage', '元素'], ['chaosDamage', '混沌'], ['sockets', '孔'], ['price', '价格']];
+  // 性价比：勾选后插在「总伤」右侧；值为当前总伤 ÷ 标价金额（沿用仅按金额、不换算货币口径）。
+  const DAMAGE_PER_PRICE_COLUMN = ['damagePerPrice', '性价比'];
   // 增幅不单独成列：勾选后数值直接并入对应点伤列与总伤（见 readWeapon）。
-  const activeColumns = () => mode === 'weapon' ? WEAPON_COLUMNS : ARMOUR_COLUMNS;
+  const activeColumns = () => mode !== 'weapon'
+    ? ARMOUR_COLUMNS
+    : showDamagePerPrice ? [WEAPON_COLUMNS[0], DAMAGE_PER_PRICE_COLUMN, ...WEAPON_COLUMNS.slice(1)] : WEAPON_COLUMNS;
   const headerRow = root.querySelector('thead tr');
   const panelRows = new Map();
   let hoveredSourceRow = null;
@@ -599,6 +618,7 @@
   function sortValue(item) {
     if (sortKey === 'sockets') return item.socketDisplay.count;
     if (sortKey === 'price') return number(item.price);
+    if (sortKey === 'damagePerPrice') return item.damagePerPrice;
     if (sortKey === 'maximum') return item.maximums[0].value;
     return item[sortKey];
   }
@@ -630,7 +650,7 @@
       const nextDirection = active && sortDirection === 'descending' || !active && key === 'price' ? '升序' : '降序';
       button.textContent = `${label}${active ? sortDirection === 'descending' ? ' ↓' : ' ↑' : ''}`;
       button.parentElement.setAttribute('aria-sort', active ? sortDirection : 'none');
-      button.title = `${label}排序，点击按${nextDirection}${key === 'price' ? '（仅按金额，不换算货币）' : key === 'maximum' ? '（按左侧18%未取整值）' : key === 'totalDamage' ? `（${countAttacksPerSecond ? '处理后总点伤 × 攻速' : '平均单次总伤'}，按未取整值）` : ''}`;
+      button.title = `${label}排序，点击按${nextDirection}${key === 'price' ? '（仅按金额，不换算货币）' : key === 'maximum' ? '（按左侧18%未取整值）' : key === 'totalDamage' ? `（${countAttacksPerSecond ? '处理后总点伤 × 攻速' : '平均单次总伤'}，按未取整值）` : key === 'damagePerPrice' ? '（总伤 ÷ 价格金额，仅按金额不换算货币，按未取整值）' : ''}`;
       button.setAttribute('aria-label', button.title);
       if (active) root.querySelector('header strong').textContent = `${mode === 'weapon' ? '武器伤害' : '装备防御'} · ${label}${sortDirection === 'descending' ? '降序' : '升序'}`;
     }
@@ -685,6 +705,7 @@
       const cellValues = {
         current: item.current, normalized: item.normalized, maximum: item.maximums?.[0]?.value ?? null,
         totalDamage: item.totalDamage,
+        damagePerPrice: item.damagePerPrice,
         physicalDamage: item.physicalDamage, elementalDamage: item.elementalDamage, chaosDamage: item.chaosDamage,
         sockets: item.socketDisplay.count, price: item.price,
       };
@@ -707,6 +728,11 @@
         if (mode === 'weapon' && Object.hasOwn(item.weaponTitles, key)) {
           td.textContent = Number.isFinite(value) ? fmt(value) : '计算不可得';
           td.title = item.weaponTitles[key];
+          if (!Number.isFinite(value)) td.classList.add('warning');
+        }
+        if (key === 'damagePerPrice') {
+          td.textContent = Number.isFinite(value) ? fmtRatio(value) : '计算不可得';
+          td.title = item.damagePerPriceTitle;
           if (!Number.isFinite(value)) td.classList.add('warning');
         }
         if (key === 'sockets') {
@@ -770,6 +796,16 @@
   get('show-details').addEventListener('change', refresh);
   get('count-aps').addEventListener('change', event => {
     countAttacksPerSecond = event.target.checked;
+    refresh();
+  });
+  get('show-damage-per-price').addEventListener('change', event => {
+    showDamagePerPrice = event.target.checked;
+    // 取消勾选后该列不再存在；若正按它排序，回落到武器默认总伤降序，避免不可见排序键。
+    if (!showDamagePerPrice && sortKey === 'damagePerPrice') {
+      sortKey = 'totalDamage';
+      sortDirection = 'descending';
+      modeSorting.weapon = { key: sortKey, direction: sortDirection };
+    }
     refresh();
   });
   const tierControls = [...root.querySelectorAll('[data-augment-tier]')];
