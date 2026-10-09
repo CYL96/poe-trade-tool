@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         POE2 装备防御与武器伤害排序浮窗
 // @namespace    poe-trade-tool
-// @version      2.5.0
-// @description  自动列出已加载装备，支持护甲防御、武器处理后总伤（可选按攻速、显示性价比）与孔内增幅点伤估算。
+// @version      2.7.2
+// @description  自动列出已加载装备，支持护甲防御、武器处理后总伤（可选按攻速、显示性价比与五类伤害明细）、孔内增幅点伤估算与行内伤害占比条。
 // @match        https://www.pathofexile.com/trade2*
 // @match        https://poe.game.qq.com/trade2*
 // @run-at       document-idle
@@ -57,11 +57,28 @@
   // 官方 trade2/data/stats（2026-10-09）与 https://www.poe2wiki.net/wiki/Modifier。
   // “… to Attacks”、Bonded 全局伤害、额外伤害和攻速不计入武器面板点伤。
   const PHYSICAL_DAMAGE_PERCENT = 'stat_1509134228';
+  // 孔内局部附加伤害按类型扣除；类型经官方 trade2/data/stats 文本核对（2026-10-09）：
+  // 火 stat_709508406、冰 stat_1037193709、电 stat_3336890334、混沌 stat_2223678961。
   const LOCAL_DAMAGE_RUNES = new Map([
     ['stat_1940865751', 'physical'], ['stat_1888719480', 'physical'],
-    ['stat_709508406', 'elemental'], ['stat_1037193709', 'elemental'],
-    ['stat_3336890334', 'elemental'], ['stat_2223678961', 'chaos'],
+    ['stat_709508406', 'fire'], ['stat_1037193709', 'cold'],
+    ['stat_3336890334', 'lightning'], ['stat_2223678961', 'chaos'],
   ]);
+  // 伤害占比条：固定顺序物理 → 闪电 → 火焰 → 冰冷 → 混沌与用户确认的配色。
+  const DAMAGE_BREAKDOWN = [
+    { key: 'physical', label: '物理', color: '#65B96E' },
+    { key: 'lightning', label: '闪电', color: '#F2D34F' },
+    { key: 'fire', label: '火焰', color: '#EF6548' },
+    { key: 'cold', label: '冰冷', color: '#70C8F2' },
+    { key: 'chaos', label: '混沌', color: '#AE78DB' },
+  ];
+  // 元素伤害面板按页面自身标记区分类型：旧 colour 类或新 CSS 变量；仅按标记唯一判定，不按出现顺序猜类型。
+  const ELEMENTAL_TYPES = [
+    { key: 'fire', selector: '.colourFireDamage, [style*="--colour-fire-damage"]' },
+    { key: 'cold', selector: '.colourColdDamage, [style*="--colour-cold-damage"]' },
+    { key: 'lightning', selector: '.colourLightningDamage, [style*="--colour-lightning-damage"]' },
+  ];
+  const ELEMENTAL_SELECTOR = ELEMENTAL_TYPES.map(type => type.selector).join(', ');
   // trade2/data/stats（2026-10-09 核对）：'…increased effect of Socketed Augment Items'（stat_2081918629）
   // 与 '…of Socketed Runes'（stat_704409219）会放大孔内符文数值；'…of Socketed Soul Cores'
   // （stat_4065505214）只作用于灵魂核心，不影响符文，因此不参与符文反推与新增符文估算。
@@ -114,11 +131,13 @@
     const ranges = [...value.matchAll(/(\d+(?:\.\d+)?)\s*(?:[-–—~～至到]|to)\s*(\d+(?:\.\d+)?)/gi)].map(match => [Number(match[1]), Number(match[2])]);
     return ranges.length && ranges.every(([min, max]) => Number.isFinite(min) && Number.isFinite(max) && min <= max) ? ranges : null;
   }
-  function socketFreeDamage(row, mods, ranges) {
+  // elementalRanges 为火 / 冰 / 电各自的已解析范围（元素全部可由页面标记分类时传入，否则 null）；
+  // 合并的「元素」列口径不变，拆分仅用于伤害占比条。
+  function socketFreeDamage(row, mods, ranges, elementalRanges) {
     const labels = { physical: '物理', elemental: '元素', chaos: '混沌' };
     const values = {};
     const titles = {};
-    const fail = reason => ({ values: { physical: null, elemental: null, chaos: null }, titles: { physical: reason, elemental: reason, chaos: reason }, reason, equipmentPercent: null });
+    const fail = reason => ({ values: { physical: null, elemental: null, chaos: null }, titles: { physical: reason, elemental: reason, chaos: reason }, types: null, reason, equipmentPercent: null });
     if (Object.values(ranges).some(value => value === null)) return fail('武器伤害面板范围无法解析');
     if (!Object.values(ranges).some(value => value.length)) return fail('未读取到武器伤害面板范围');
     const runes = mods.filter(mod => mod.type === 'rune');
@@ -144,7 +163,8 @@
     if (percentRunes.length && equipment.concat(percentRunes).some(mod => mod.percent === null)) return fail('物理伤害增幅百分比无法解析');
     const equipmentPercent = equipment.reduce((sum, mod) => sum + (mod.percent ?? 0), 0);
     const runePercent = percentRunes.reduce((sum, mod) => sum + mod.percent, 0);
-    const flat = { physical: [0, 0], elemental: [0, 0], chaos: [0, 0] };
+    // 孔内附加按火 / 冰 / 电 / 物理 / 混沌分别累计；元素组是其三类之和。
+    const flat = { physical: [0, 0], fire: [0, 0], cold: [0, 0], lightning: [0, 0], chaos: [0, 0] };
     for (const mod of localRunes) {
       const key = LOCAL_DAMAGE_RUNES.get(mod.id);
       if (!key) continue;
@@ -155,6 +175,9 @@
       flat[key][0] += added[0][0];
       flat[key][1] += added[0][1];
     }
+    const flatAverage = key => key === 'elemental'
+      ? ['fire', 'cold', 'lightning'].reduce((sum, type) => sum + (flat[type][0] + flat[type][1]) / 2, 0)
+      : (flat[key][0] + flat[key][1]) / 2;
     const hasPhysicalFlat = localRunes.some(mod => LOCAL_DAMAGE_RUNES.get(mod.id) === 'physical');
     const qualityText = field(row, 'quality');
     const quality = qualityText ? number(qualityText) : 0;
@@ -170,7 +193,7 @@
     const note = `\n移除已识别的孔内局部伤害增幅，保留装备词缀；仅物理品质不足20%补至20%，更高品质保留，元素与混沌不受品质影响。${effectNote}不反推裸基础，不计全局/条件伤害、暴击、技能或角色加成。面板取整可能造成反推偏差；排序使用未取整值。`;
     for (const key of Object.keys(labels)) {
       const observed = ranges[key].reduce((sum, [min, max]) => sum + (min + max) / 2, 0);
-      const added = (flat[key][0] + flat[key][1]) / 2;
+      const added = flatAverage(key);
       const ratio = key === 'physical' && percentRunes.length ? factor / denominator : 1;
       const flatFactor = key === 'physical' && hasPhysicalFlat ? factor * (1 + quality / 100) : 1;
       const value = (observed * ratio - added * flatFactor) * (key === 'physical' ? physicalQualityRatio : 1);
@@ -178,7 +201,18 @@
       values[key] = value;
       titles[key] = `${labels[key]}点伤：[当前面板平均 ${fmt(observed)}${ratio !== 1 ? ` × (1 + ${fmt(equipmentPercent * 100)}/100) ÷ (1 + ${fmt(equipmentPercent * 100)}/100 + ${fmt(runePercent * 100)}/100)` : ''}${added ? ` − 孔内附加平均 ${fmt(added)}${key === 'physical' ? ` × (1 + ${fmt(equipmentPercent * 100)}/100) × (1 + ${fmt(quality)}/100)` : ''}` : ''}]${key === 'physical' && ranges.physical.length ? ` × (1 + ${fmt(targetQuality)}/100) ÷ (1 + ${fmt(quality)}/100)（品质 ${fmt(quality)}% → ${fmt(targetQuality)}%）` : ''} = ${fmt(value)}（不乘攻速）${note}`;
     }
-    return { values, titles, reason: '', equipmentPercent };
+    // 五类处理后点伤：元素全部可按标记分类时才提供拆分；某类反推为负说明面板与增幅数据不一致，不拆分。
+    let types = null;
+    if (elementalRanges) {
+      const split = { fire: null, cold: null, lightning: null };
+      for (const key of Object.keys(split)) {
+        const observed = elementalRanges[key].reduce((sum, [min, max]) => sum + (min + max) / 2, 0);
+        const value = observed - flatAverage(key);
+        if (Number.isFinite(value) && value >= 0) split[key] = value;
+      }
+      if (Object.keys(split).every(key => Number.isFinite(split[key]))) types = { physical: values.physical, chaos: values.chaos, ...split };
+    }
+    return { values, titles, types, reason: '', equipmentPercent };
   }
   // 按「可用孔 − 特殊孔」插满所选增幅估算点伤；基数已移除原有孔内局部增幅，故本次新增的增幅只加一次。
   // 估算值不单独成列：由 readWeapon 并入对应点伤列与总伤；失败时 values 为 null，受影响列显示计算不可得。
@@ -213,7 +247,15 @@
     const formula = augment.type === 'percent'
       ? `每孔 ${fmt(perSocket * 100)}% 物理${runeEffectMods.length ? `（档位 ${tierText} × ${fmt(multiplier)} 向下取整）` : ''}；物理 = 去增幅物理 ${fmt(physical)} × (1 + ${fmt(damage.equipmentPercent * 100)}/100 + ${sockets} × ${fmt(perSocket * 100)}/100) ÷ (1 + ${fmt(damage.equipmentPercent * 100)}/100) = ${fmt(physicalDamage)}；总点伤 = 物理 ${fmt(physicalDamage)} + 元素 ${fmt(elemental)} + 混沌 ${fmt(chaos)} = ${fmt(total)}`
       : `每孔附加 ${effective[0]}–${effective[1]}（平均 ${fmt(perSocket)}${runeEffectMods.length ? `；档位 ${tierText} × ${fmt(multiplier)} 向下取整` : ''}）；元素 = 去增幅元素 ${fmt(elemental)} + ${sockets} × ${fmt(perSocket)} = ${fmt(elementalDamage)}；总点伤 = 物理 ${fmt(physical)} + 元素 ${fmt(elementalDamage)} + 混沌 ${fmt(chaos)} = ${fmt(total)}`;
-    return { ...result, values: { physical: physicalDamage, elemental: elementalDamage, chaos, total }, formula };
+    // 五类点伤同步并入本次增幅，供伤害占比条使用；基数不可拆分时保持 null。
+    const types = damage.types ? {
+      physical: physicalDamage,
+      fire: augment.key === 'fire' ? damage.types.fire + added : damage.types.fire,
+      cold: augment.key === 'cold' ? damage.types.cold + added : damage.types.cold,
+      lightning: augment.key === 'lightning' ? damage.types.lightning + added : damage.types.lightning,
+      chaos: damage.types.chaos,
+    } : null;
+    return { ...result, values: { physical: physicalDamage, elemental: elementalDamage, chaos, total }, types, formula };
   }
   // 增幅说明：附加到受影响点伤列与总伤的悬停文案；只有估算成功才声明「已并入」，
   // 失败写明「未能估算」且不重复列标题里已有的同一原因。
@@ -234,14 +276,36 @@
       limitation,
     ].join('\n');
   }
+  // 伤害占比条只使用处理后的五类平均单次点伤：无法可靠拆分元素、或所选增幅估算失败时，
+  // 返回原因而不绘制部分比例，避免用面板比例冒充处理后的构成。
+  function damageBreakdown(damage, augment) {
+    if (damage.reason) return { reason: damage.reason };
+    if (augment && !augment.values) return { reason: augment.reason || '增幅估算失败，无法确认处理后的伤害构成' };
+    const types = augment ? augment.types : damage.types;
+    if (!types) return { reason: '元素伤害面板未按火焰 / 冰冷 / 闪电分类或类型标记不唯一，无法拆分伤害占比' };
+    // 占比不乘攻速；增幅说明只在估算并入时声明。
+    const note = augment
+      ? `已计入当前选择的增幅估算（${augment.label} · ${augment.tierName}）；不含技能、暴击与角色加成。`
+      : '未选择增幅估算；不含技能、暴击与角色加成。';
+    return { types, note };
+  }
   function readWeapon(row, index) {
     const physical = damageRanges(damageProperty(row, 'pdamage'), /^(?:Physical Damage|物理[傷伤]害)\s*[:：]?$/i);
     const elementalProperty = damageProperty(row, 'edamage');
     // 原生元素范围可能通过旧 colour 类或新 CSS 变量着色；只去掉嵌套重复节点。
-    const elementalSelector = '.colourFireDamage, .colourColdDamage, .colourLightningDamage, [style*="--colour-fire-damage"], [style*="--colour-cold-damage"], [style*="--colour-lightning-damage"]';
-    const elementalParts = [...(elementalProperty?.querySelectorAll(elementalSelector) || [])].filter(element => !element.parentElement?.closest(elementalSelector));
+    const elementalParts = [...(elementalProperty?.querySelectorAll(ELEMENTAL_SELECTOR) || [])].filter(element => !element.parentElement?.closest(ELEMENTAL_SELECTOR));
     const elementalGroups = elementalParts.map(element => damageRanges(element, /^(?:Fire|Cold|Lightning) Damage\s*[:：]?$/i));
     const elemental = elementalParts.length ? elementalGroups.some(ranges => ranges === null || !ranges.length) ? null : elementalGroups.flat() : damageRanges(elementalProperty, /^(?:Elemental Damage|元素[傷伤]害)\s*[:：]?$/i);
+    // 火 / 冰 / 电拆分：每段必须由页面标记唯一确定类型；无元素范围时三类均按零处理，供占比条使用。
+    const elementalRanges = { fire: [], cold: [], lightning: [] };
+    let elementalSplit = elementalParts.length > 0;
+    for (const [partIndex, part] of elementalParts.entries()) {
+      const matched = ELEMENTAL_TYPES.filter(type => part.matches(type.selector));
+      const ranges = elementalGroups[partIndex];
+      if (matched.length !== 1 || !Array.isArray(ranges) || !ranges.length) { elementalSplit = false; break; }
+      elementalRanges[matched[0].key].push(...ranges);
+    }
+    if (!elementalParts.length) elementalSplit = Array.isArray(elemental) && elemental.length === 0;
     const chaos = damageRanges(damageProperty(row, 'cdamage'), /^(?:Chaos Damage|混沌[傷伤]害)\s*[:：]?$/i);
     const attacksPerSecond = number(text(damageProperty(row, 'aps')));
     const validSpeed = Number.isFinite(attacksPerSecond) && attacksPerSecond > 0;
@@ -249,7 +313,7 @@
     const classCount = sockets?.className.match(/numSockets(\d+)/);
     const socketCount = Math.max(classCount ? Number(classCount[1]) : 0, row.querySelectorAll('.socket').length);
     const mods = readModifiers(row);
-    const damage = socketFreeDamage(row, mods, { physical, elemental, chaos });
+    const damage = socketFreeDamage(row, mods, { physical, elemental, chaos }, elementalSplit ? elementalRanges : null);
     const socketFreeTotal = damage.reason ? null : damage.values.physical + damage.values.elemental + damage.values.chaos;
     const states = readItemStates(row);
     const display = socketDisplay(row, socketCount, mods, true, states);
@@ -301,6 +365,7 @@
       damagePerPrice,
       damagePerPriceTitle,
       weaponTitles,
+      breakdown: damageBreakdown(damage, augment),
     };
   }
   // 交易结果的状态标志：腐化/圣化/复制。官方 trade2 以标签文字表示状态，
@@ -519,9 +584,20 @@
       tr.has-details td { border-bottom:0; }
       tr.defense-details td { width:auto; padding-top:0; text-align:center; color:#aeb7c5; font-size:12px; }
       tr.source-hovered td { background:#403721; box-shadow:inset 0 1px #75613e,inset 0 -1px #75613e; }
+      /* 高亮同一件装备时主行与详情行看成一整块：内部不画线，只在区域最上/最下保留高亮边线。 */
+      tr.source-hovered.has-details td { box-shadow:inset 0 1px #75613e; }
+      tr.weapon-details.source-hovered td, tr.defense-details.source-hovered td { box-shadow:inset 0 -1px #75613e; }
       .detail-ar { color:#ff9292; }
       .detail-ev { color:#91db91; }
       .detail-es { color:#85baff; }
+      tr.weapon-details td { width:auto; padding-top:0; text-align:center; color:#aeb7c5; font-size:12px; }
+      /* 伤害占比条：固定 160px、居中；各段按未取整点伤比例分配，颜色见 DAMAGE_BREAKDOWN。 */
+      .damage-bar { display:flex; width:160px; max-width:100%; height:6px; margin:0 auto; background:#0f1217; border:1px solid #515a68; border-radius:3px; overflow:hidden; }
+      .damage-bar:focus-visible { outline:2px solid #e7c889; outline-offset:2px; }
+      .damage-segment { flex:1 1 0; min-width:0; }
+      .damage-note { display:inline-block; width:160px; white-space:normal; }
+      /* 五类明细数值：按 DAMAGE_BREAKDOWN 颜色显示正数项，位于占比条上方；允许换行。 */
+      .damage-values { margin:0 0 4px; white-space:normal; }
       @media (max-width:450px) { .panel-controls { padding:6px; } .table-scroll { padding:0 6px 6px; } th,td { padding:6px 2px; font-size:12px; } }
     </style>
     <button id="launcher" type="button" aria-label="展开装备排序浮窗" aria-expanded="false" aria-controls="panel" title="点击展开装备排序，拖动移动">POE</button>
@@ -537,6 +613,7 @@
         <div class="option-row">
         <label class="detail-option" title="勾选后总伤 = 处理后的总点伤 × 每秒攻击次数（含已选增幅估算）；不勾选时总伤为平均单次伤害。攻速缺失或无效时总伤显示计算不可得。"><input id="count-aps" type="checkbox">计算攻速</label>
         <label class="detail-option" title="在武器表格显示「性价比」列（位于「总伤」右侧）：当前总伤 ÷ 标价金额，保留2位小数；仅按金额，不换算货币。总伤随「计算攻速」与增幅估算变化。"><input id="show-damage-per-price" type="checkbox">显示性价比</label>
+        <label class="detail-option" title="勾选后在每行武器下方列出物理 / 闪电 / 火焰 / 冰冷 / 混沌的处理后平均单次点伤（与占比条同源，含增幅估算，不乘攻速）；某类型为 0 时不显示该项。"><input id="show-weapon-details" type="checkbox">显示详细数值</label>
         </div>
         <div class="option-row">
         <label class="detail-option" title="预留给特殊符文的孔数；估算增幅时从可用孔中扣除，默认 0">特殊孔<select id="special-sockets" aria-label="特殊孔数量"></select></label>
@@ -593,7 +670,8 @@
     for (const [tr, active] of [[highlightedPanelRow, false], [next, true]]) {
       if (!tr) continue;
       tr.classList.toggle('source-hovered', active);
-      if (tr.nextElementSibling?.classList.contains('defense-details')) tr.nextElementSibling.classList.toggle('source-hovered', active);
+      const details = tr.nextElementSibling;
+      if (details?.matches('.defense-details, .weapon-details')) details.classList.toggle('source-hovered', active);
     }
     highlightedPanelRow = next;
   }
@@ -752,6 +830,60 @@
         tr.append(td);
       }
       fragment.append(tr);
+      if (mode === 'weapon' && item.breakdown) {
+        tr.classList.add('has-details');
+        const detailRow = document.createElement('tr');
+        detailRow.className = 'weapon-details';
+        detailRow.addEventListener('click', () => locateSourceRow(item.row));
+        const detailCell = document.createElement('td');
+        detailCell.colSpan = tr.children.length;
+        const types = item.breakdown.types;
+        const total = types ? DAMAGE_BREAKDOWN.reduce((sum, entry) => sum + types[entry.key], 0) : 0;
+        // 可选明细：按固定顺序与配色列出正数项；无需猜测，为 0 或不可得的类型不显示。
+        if (types && get('show-weapon-details').checked) {
+          const line = document.createElement('div');
+          line.className = 'damage-values';
+          line.title = '处理后平均单次点伤，含已选增幅估算（若有）；不乘攻速，与伤害占比条同源。';
+          for (const entry of DAMAGE_BREAKDOWN) {
+            const value = types[entry.key];
+            if (!(value > 0)) continue;
+            if (line.childNodes.length) line.append(' · ');
+            const valueElement = document.createElement('span');
+            valueElement.style.color = entry.color;
+            valueElement.textContent = `${entry.label} ${fmt(value)}`;
+            line.append(valueElement);
+          }
+          if (line.childNodes.length) detailCell.append(line);
+        }
+        if (types && total > 0) {
+          const lines = ['武器伤害构成 · 处理后平均单次点伤，不乘攻速'];
+          const bar = document.createElement('div');
+          bar.className = 'damage-bar';
+          bar.tabIndex = 0;
+          bar.setAttribute('role', 'img');
+          for (const entry of DAMAGE_BREAKDOWN) {
+            const value = types[entry.key];
+            if (!(value > 0)) continue;
+            lines.push(`${entry.label}：${fmt(value)}（${Math.round(value / total * 100)}%）`);
+            const segment = document.createElement('span');
+            segment.className = 'damage-segment';
+            segment.style.backgroundColor = entry.color;
+            segment.style.flexGrow = String(value);
+            bar.append(segment);
+          }
+          lines.push(item.breakdown.note);
+          bar.title = lines.join('\n');
+          bar.setAttribute('aria-label', lines.join('；'));
+          detailCell.append(bar);
+        } else {
+          const note = document.createElement('span');
+          note.className = 'damage-note';
+          note.textContent = types ? '无伤害占比' : `占比不可得：${item.breakdown.reason}`;
+          detailCell.append(note);
+        }
+        detailRow.append(detailCell);
+        fragment.append(detailRow);
+      }
       if (mode === 'armour' && get('show-details').checked && item.values.slice(0, 3).some(Number.isFinite)) {
         tr.classList.add('has-details');
         const detailRow = document.createElement('tr');
@@ -794,6 +926,7 @@
   get('refresh').addEventListener('click', refresh);
   get('back-top').addEventListener('click', () => window.scrollTo({ top: 0, behavior: 'smooth' }));
   get('show-details').addEventListener('change', refresh);
+  get('show-weapon-details').addEventListener('change', refresh);
   get('count-aps').addEventListener('change', event => {
     countAttacksPerSecond = event.target.checked;
     refresh();
