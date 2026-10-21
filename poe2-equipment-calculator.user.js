@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         POE2 装备防御与武器伤害排序浮窗
 // @namespace    poe-trade-tool
-// @version      2.11.9
+// @version      2.11.10
 // @description  自动列出已加载物品，支持通用名称/价格列表、装备防御与武器伤害排序，未识别到防御或武器字段时自动切换通用；支持收藏、调试复制、防御/伤害分项、孔内增幅估算、性价比、输入自动转繁体与自适应/拖动面板宽度。
 // @match        https://www.pathofexile.com/trade2*
 // @match        https://poe.game.qq.com/trade2*
@@ -808,8 +808,8 @@
       .toolbar-actions button { min-width:0; font-size:12px; padding:3px 5px; }
       .detail-option { display:flex; align-items:center; gap:4px; font-size:12px; cursor:pointer; }
       #debug-toggle[aria-pressed="true"], #favorites-toggle[aria-pressed="true"], .favorite[aria-pressed="true"] { border-color:#e7c889; color:#e7c889; }
-      .copy-debug { margin-left:4px; font-size:11px; }
-      .favorite { width:28px; height:28px; margin-right:4px; padding:0; font-size:20px; line-height:1; text-align:center; }
+      .copy-debug { font-size:11px; }
+      .favorite { width:28px; height:28px; padding:0; font-size:20px; line-height:1; text-align:center; }
       #debug-output { width:100%; height:100px; margin-top:4px; font:12px/1.5 monospace; color:inherit; background:#171b22; border:1px solid #515a68; }
       /* 分三行固定分组：显示项 / 特殊孔＋档位 / 增幅类型；避免单行过宽把面板撑开。 */
       .mode-options { display:flex; flex-direction:column; gap:6px; margin-top:8px; }
@@ -827,10 +827,12 @@
       .locate { border:0; background:none; padding:0; text-align:right; white-space:normal; overflow-wrap:anywhere; color:#e7c889; text-decoration:underline dotted; text-underline-offset:3px; }
       /* 整行可点击定位交易页条目。 */
       tbody tr { cursor:pointer; }
-      .states { width:1px; text-align:left; }
+      /* 收藏与状态作为一组并列居中，单独保留不换行的宽度，不受数值列的换行规则挤压。 */
+      .states { width:1px; text-align:center; white-space:nowrap; overflow-wrap:normal; }
+      .state-group { display:inline-flex; align-items:center; justify-content:center; gap:4px; vertical-align:middle; }
+      .state-group > * { flex:0 0 auto; white-space:nowrap; }
       th.name, td.name { text-align:left; white-space:normal; max-width:180px; overflow-wrap:anywhere; }
       .state { padding:0 3px; border:1px solid currentColor; border-radius:4px; font-size:11px; }
-      .state + .state { margin-left:4px; }
       .state-corrupted { color:#ff6b6b; }
       .state-sanctified { color:#ffe066; }
       .state-mirrored { color:#c084fc; }
@@ -1250,13 +1252,16 @@
       panelRows.set(item.row, tr);
       const statesCell = document.createElement('td');
       statesCell.className = 'states';
-      statesCell.append(favoriteButton(item.row));
+      const stateGroup = document.createElement('span');
+      stateGroup.className = 'state-group';
+      statesCell.append(stateGroup);
+      stateGroup.append(favoriteButton(item.row));
       for (const state of item.states) {
         const badge = document.createElement('span');
         badge.className = `state state-${state.key}`;
         badge.textContent = state.flag;
         badge.title = state.label;
-        statesCell.append(badge);
+        stateGroup.append(badge);
       }
       tr.append(statesCell);
       const cellValues = {
@@ -1334,7 +1339,7 @@
         const status = [item.physicalDamage, item.elementalDamage, item.chaosDamage].some(Number.isFinite) ? '部分不可计算' : '不可计算';
         badge.title = `${status}：\n${failures.map(failure => `${failure.column === 'breakdown' ? '占比' : activeColumns().find(([key]) => key === failure.column)?.[1] || failure.column}：${failure.reason}`).join('\n')}`;
         badge.setAttribute('aria-label', badge.title);
-        statesCell.append(badge);
+        stateGroup.append(badge);
       }
       if (debugEnabled) {
         if (failures.length) {
@@ -1347,7 +1352,7 @@
             event.stopPropagation();
             copyEquipmentDebug(item, failures);
           });
-          statesCell.append(button);
+          stateGroup.append(button);
         }
       }
       fragment.append(tr);
