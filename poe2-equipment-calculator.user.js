@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         POE2 装备防御与武器伤害排序浮窗
 // @namespace    poe-trade-tool
-// @version      2.11.8
-// @description  自动列出已加载物品，支持通用名称/价格列表、装备防御与武器伤害排序，未识别到防御或武器字段时自动切换通用；支持收藏、调试复制、防御/伤害分项、孔内增幅估算、性价比与输入自动转繁体。
+// @version      2.11.9
+// @description  自动列出已加载物品，支持通用名称/价格列表、装备防御与武器伤害排序，未识别到防御或武器字段时自动切换通用；支持收藏、调试复制、防御/伤害分项、孔内增幅估算、性价比、输入自动转繁体与自适应/拖动面板宽度。
 // @match        https://www.pathofexile.com/trade2*
 // @match        https://poe.game.qq.com/trade2*
 // @run-at       document-idle
@@ -779,9 +779,9 @@
   const root = host.attachShadow({ mode: 'open' });
   root.innerHTML = `
     <style>
-      /* 固定展开宽度，内容只撑开表格滚动区，不再撑开面板；窄视口退让到视口宽度。 */
-      :host { width:min(360px,calc(100vw - 24px)); font:13px/1.5 system-ui,-apple-system,"Microsoft YaHei",sans-serif; color:#e8e3db; }
-      :host([data-collapsed]) { width:48px; min-width:48px; }
+      /* 默认随内容横向扩展且不超出视口；手动缩窄时让内容换行，不隐藏表格数据。 */
+      :host { width:var(--panel-width,max-content); min-width:min(320px,calc(100vw - 24px)); max-width:calc(100vw - 24px); font:13px/1.5 system-ui,-apple-system,"Microsoft YaHei",sans-serif; color:#e8e3db; }
+      :host([data-collapsed]) { width:48px; min-width:48px; max-width:48px; }
       * { box-sizing:border-box; }
       .panel { display:flex; flex-direction:column; max-height:max(48px,calc(100vh - var(--panel-top,100px) - 12px)); background:#171b22; border:1px solid #75613e; border-radius:10px; box-shadow:0 8px 30px #0008; overflow:hidden; }
       header { display:flex; flex-shrink:0; align-items:center; justify-content:space-between; gap:8px; min-height:48px; padding:0 0 0 8px; border-bottom:1px solid #343c48; background:#252b35; cursor:move; touch-action:none; }
@@ -792,12 +792,19 @@
       .header-actions { display:flex; flex-shrink:0; align-items:center; gap:4px; }
       .header-actions #debug-toggle { padding:3px 6px; font-size:12px; }
       #launcher { display:block; border-radius:50%; border-color:#75613e; background:#171b22; color:#e7c889; font-weight:700; box-shadow:0 8px 30px #0008; touch-action:none; }
+      /* 两侧窄边缘不占内容空间，也不遮挡表格内的滚动条。 */
+      .resize-handle { position:absolute; top:48px; bottom:10px; z-index:1; width:10px; border:0; border-radius:4px; padding:0; background:transparent; cursor:ew-resize; touch-action:none; }
+      .resize-handle::after { content:""; position:absolute; top:50%; left:4px; width:2px; height:28px; max-height:100%; transform:translateY(-50%); border-radius:2px; background:#75613e; }
+      .resize-handle:hover::after, .resize-handle:focus-visible::after { background:#e7c889; }
+      #resize-left { left:-5px; }
+      #resize-right { right:-5px; }
+      :host([data-collapsed]) .resize-handle { display:none; }
       .body { display:flex; flex-direction:column; min-height:0; overflow:hidden; }
       .panel-controls { flex-shrink:0; padding:8px; }
       .table-scroll { min-height:0; overflow:auto; padding:0 8px 8px; }
       [hidden] { display:none !important; }
       .toolbar { display:flex; flex-direction:column; gap:6px; }
-      .toolbar-actions { display:flex; align-items:center; gap:4px; }
+      .toolbar-actions { display:flex; flex-wrap:wrap; align-items:center; gap:4px; }
       .toolbar-actions button { min-width:0; font-size:12px; padding:3px 5px; }
       .detail-option { display:flex; align-items:center; gap:4px; font-size:12px; cursor:pointer; }
       #debug-toggle[aria-pressed="true"], #favorites-toggle[aria-pressed="true"], .favorite[aria-pressed="true"] { border-color:#e7c889; color:#e7c889; }
@@ -813,11 +820,11 @@
       .mode-switch button[aria-pressed="true"] { color:#e7c889; border-color:#e7c889; background:#353020; }
       .muted { color:#aeb7c5; font-size:12px; }
       .warning { color:#f5c786; }
-      table { width:max-content; min-width:100%; table-layout:auto; border-collapse:collapse; font-variant-numeric:tabular-nums; color:inherit; }
-      th, td { padding:6px 3px; border-bottom:1px solid #343c48; text-align:right; vertical-align:middle; white-space:nowrap; }
+      table { width:100%; table-layout:auto; border-collapse:collapse; font-variant-numeric:tabular-nums; color:inherit; }
+      th, td { padding:6px 3px; border-bottom:1px solid #343c48; text-align:right; vertical-align:middle; white-space:normal; overflow-wrap:anywhere; }
       th { color:#c0c7d2; font-size:12px; }
       .sort { border:0; background:none; padding:0; width:100%; text-align:inherit; color:inherit; }
-      .locate { border:0; background:none; padding:0; text-align:right; white-space:nowrap; color:#e7c889; text-decoration:underline dotted; text-underline-offset:3px; }
+      .locate { border:0; background:none; padding:0; text-align:right; white-space:normal; overflow-wrap:anywhere; color:#e7c889; text-decoration:underline dotted; text-underline-offset:3px; }
       /* 整行可点击定位交易页条目。 */
       tbody tr { cursor:pointer; }
       .states { width:1px; text-align:left; }
@@ -922,7 +929,9 @@
         <table><thead><tr></tr></thead><tbody></tbody></table>
         </div>
       </div>
-    </section>`;
+    </section>
+    <button id="resize-left" class="resize-handle" type="button" aria-label="调整面板左边缘宽度" aria-controls="panel" title="拖动调整左边缘；左右方向键微调，Shift 加速；Home 或双击恢复自动宽度"></button>
+    <button id="resize-right" class="resize-handle" type="button" aria-label="调整面板右边缘宽度" aria-controls="panel" title="拖动调整右边缘；左右方向键微调，Shift 加速；Home 或双击恢复自动宽度"></button>`;
   document.body.append(host);
   const get = id => root.getElementById(id);
   let timer = null;
@@ -1578,6 +1587,7 @@
     status.textContent = '已定位加载更多按钮，请在交易页手动点击加载。';
   });
   function setCollapsed(collapsed) {
+    stopPanelResize();
     const anchor = host.getBoundingClientRect();
     host.toggleAttribute('data-collapsed', collapsed);
     get('panel').hidden = collapsed;
@@ -1600,6 +1610,31 @@
   get('collapse').addEventListener('click', () => setCollapsed(true));
   const header = root.querySelector('header');
   let drag = null;
+  let panelResize = null;
+  // null 为内容自适应；手动期望宽度仅在本页保留，窗口缩小时不覆盖，放大后可恢复。
+  let panelWidth = null;
+  function applyPanelWidth() {
+    if (panelWidth === null) {
+      host.style.removeProperty('--panel-width');
+      return;
+    }
+    const maximum = Math.max(0, window.innerWidth - 24);
+    host.style.setProperty('--panel-width', `${Math.max(Math.min(320, maximum), Math.min(panelWidth, maximum))}px`);
+  }
+  function resizePanel(width, side, anchor) {
+    const maximum = Math.max(0, window.innerWidth - 24);
+    panelWidth = width === null ? null : Math.max(Math.min(320, maximum), Math.min(width, maximum));
+    applyPanelWidth();
+    const box = host.getBoundingClientRect();
+    // 调整或恢复自动宽度时固定相反一侧；超出视口时仍由原定位逻辑钳制。
+    position(side === 'left' ? anchor.right - box.width : anchor.left, anchor.top);
+  }
+  function stopPanelResize(event) {
+    if (!panelResize || event && event.pointerId !== panelResize.pointerId) return;
+    const { handle, pointerId } = panelResize;
+    panelResize = null;
+    if (handle.hasPointerCapture(pointerId)) handle.releasePointerCapture(pointerId);
+  }
   function position(left, top) {
     const box = host.getBoundingClientRect();
     host.style.right = 'auto';
@@ -1610,27 +1645,61 @@
   }
   for (const handle of [header, get('launcher')]) {
     handle.addEventListener('pointerdown', event => {
-      if (event.button !== 0 || handle === header && event.target.closest('button')) return;
+      if (drag || panelResize || event.button !== 0 || handle === header && event.target.closest('button')) return;
       suppressLauncherClick = false;
       const box = host.getBoundingClientRect();
-      drag = { x: event.clientX - box.left, y: event.clientY - box.top, startX: event.clientX, startY: event.clientY, moved: false, handle };
+      drag = { pointerId: event.pointerId, x: event.clientX - box.left, y: event.clientY - box.top, startX: event.clientX, startY: event.clientY, moved: false, handle };
       handle.setPointerCapture(event.pointerId);
     });
     handle.addEventListener('pointermove', event => {
-      if (!drag || drag.handle !== handle) return;
+      if (!drag || drag.handle !== handle || event.pointerId !== drag.pointerId) return;
       if (Math.hypot(event.clientX - drag.startX, event.clientY - drag.startY) > 4) drag.moved = true;
       if (drag.moved) position(event.clientX - drag.x, event.clientY - drag.y);
     });
     const stopDrag = event => {
-      if (!drag || drag.handle !== handle) return;
+      if (!drag || drag.handle !== handle || event.pointerId !== drag.pointerId) return;
       if (event.type === 'pointerup' && handle === get('launcher')) suppressLauncherClick = drag.moved;
+      const pointerId = drag.pointerId;
       drag = null;
+      if (handle.hasPointerCapture(pointerId)) handle.releasePointerCapture(pointerId);
     };
     handle.addEventListener('pointerup', stopDrag);
     handle.addEventListener('pointercancel', stopDrag);
     handle.addEventListener('lostpointercapture', stopDrag);
   }
-  window.addEventListener('resize', () => { const box = host.getBoundingClientRect(); position(box.left, box.top); });
+  for (const side of ['left', 'right']) {
+    const handle = get(`resize-${side}`);
+    handle.addEventListener('pointerdown', event => {
+      if (event.button !== 0 || drag || panelResize || host.hasAttribute('data-collapsed')) return;
+      event.preventDefault();
+      handle.focus({ preventScroll: true });
+      const box = host.getBoundingClientRect();
+      panelResize = { handle, pointerId: event.pointerId, startX: event.clientX, width: box.width, anchor: box };
+      handle.setPointerCapture(event.pointerId);
+    });
+    handle.addEventListener('pointermove', event => {
+      if (!panelResize || panelResize.handle !== handle || event.pointerId !== panelResize.pointerId) return;
+      const delta = (event.clientX - panelResize.startX) * (side === 'left' ? -1 : 1);
+      resizePanel(panelResize.width + delta, side, panelResize.anchor);
+    });
+    for (const type of ['pointerup', 'pointercancel', 'lostpointercapture']) handle.addEventListener(type, stopPanelResize);
+    handle.addEventListener('keydown', event => {
+      if (!['ArrowLeft', 'ArrowRight', 'Home'].includes(event.key) || drag || panelResize) return;
+      event.preventDefault();
+      const anchor = host.getBoundingClientRect();
+      const step = (event.shiftKey ? 40 : 10) * (event.key === 'ArrowLeft' ? -1 : 1) * (side === 'left' ? -1 : 1);
+      resizePanel(event.key === 'Home' ? null : anchor.width + step, side, anchor);
+    });
+    handle.addEventListener('dblclick', () => {
+      if (drag || panelResize) return;
+      resizePanel(null, side, host.getBoundingClientRect());
+    });
+  }
+  window.addEventListener('resize', () => {
+    const box = host.getBoundingClientRect();
+    applyPanelWidth();
+    position(box.left, box.top);
+  });
   const panelResizeObserver = new ResizeObserver(() => {
     if (!host.style.left) return;
     const box = host.getBoundingClientRect();
